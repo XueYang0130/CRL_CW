@@ -1,0 +1,8 @@
+torch==2.7.1
+numpy==1.26.4
+gymnasium>=1.1,<2.0
+mujoco==3.3.0
+metaworld==3.1.1
+pytest==8.3.5
+pyyaml==6.0.2
+tqdm==4.67.1
