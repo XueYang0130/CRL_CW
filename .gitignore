@@ -1,0 +1,24 @@
+# Reference implementations and papers
+references/
+
+# Experimental outputs
+outputs/*
+!outputs/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE and OS
+.vscode/
+.DS_Store
+
+# Experiment tracking
+wandb/
