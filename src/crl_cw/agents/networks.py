@@ -1,12 +1,17 @@
-"""Neural networks for the Soft Actor-Critic agent.
+"""Multi-head neural networks for the ClonEx-SAC baseline.
 
-This module is a PyTorch implementation of the basic single-head actor
-and critic architecture used by the ClonEx-SAC reference code.
+The CW10 observation contains:
 
+    physical MetaWorld observation + ten-dimensional task one-hot vector
+
+The task one-hot vector is hidden from the shared actor and critic
+backbones. It is used only to choose the active task-specific output head,
+matching the Continual World / ClonEx-SAC reference implementation.
 """
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import NamedTuple
 
@@ -20,7 +25,7 @@ DEFAULT_HIDDEN_SIZES: tuple[int, ...] = (256, 256, 256, 256)
 LOG_STD_MIN = -20.0
 LOG_STD_MAX = 2.0
 LEAKY_RELU_SLOPE = 0.2
-LOG_PROB_EPSILON = 1e-6
+LAYER_NORM_EPSILON = 1e-3
 
 
 class ActorOutput(NamedTuple):
@@ -33,28 +38,68 @@ class ActorOutput(NamedTuple):
 
 
 def initialize_linear_layer(layer: nn.Linear) -> None:
-    """Initialize a linear layer like TensorFlow/Keras Dense.
-
-    The ClonEx-SAC implementation uses Keras Dense layers, whose default
-    kernel initializer is Glorot/Xavier uniform and whose bias initializer
-    is zero.
-    """
+    """Initialize a linear layer like TensorFlow/Keras Dense."""
     nn.init.xavier_uniform_(layer.weight)
     nn.init.zeros_(layer.bias)
 
 
-class ClonExMLP(nn.Module):
-    """Shared MLP architecture matching the ClonEx-SAC implementation.
+def choose_task_head(
+    all_head_outputs: torch.Tensor,
+    task_one_hot: torch.Tensor,
+    num_heads: int,
+) -> torch.Tensor:
+    """Choose the output head indicated by a task one-hot vector.
 
-    When layer normalization is enabled, the original code applies:
+    Args:
+        all_head_outputs:
+            Tensor with shape ``(batch_size, output_dim * num_heads)``.
+        task_one_hot:
+            Tensor with shape ``(batch_size, num_heads)``.
+        num_heads:
+            Number of task-specific heads.
 
-        Dense -> LayerNorm -> tanh
+    Returns:
+        Tensor with shape ``(batch_size, output_dim)``.
 
-    only to the first hidden layer. All remaining hidden layers use the
-    configured activation directly after their Dense layer.
+    This follows the reference implementation's reshape:
 
-    For the ClonEx-SAC baseline, that activation is Leaky ReLU.
+        (batch, output_dim * heads) -> (batch, output_dim, heads)
+
+    followed by multiplication with the task one-hot vector.
     """
+    if all_head_outputs.ndim != 2:
+        raise ValueError("all_head_outputs must be rank 2.")
+    if task_one_hot.ndim != 2:
+        raise ValueError("task_one_hot must be rank 2.")
+    if task_one_hot.shape[1] != num_heads:
+        raise ValueError(
+            f"Expected task one-hot dimension {num_heads}, "
+            f"received {task_one_hot.shape[1]}."
+        )
+    if all_head_outputs.shape[0] != task_one_hot.shape[0]:
+        raise ValueError(
+            "Head outputs and task one-hot must share batch size."
+        )
+    if all_head_outputs.shape[1] % num_heads != 0:
+        raise ValueError(
+            "Output dimension must be divisible by num_heads."
+        )
+
+    batch_size = all_head_outputs.shape[0]
+    reshaped = all_head_outputs.reshape(
+        batch_size,
+        -1,
+        num_heads,
+    )
+    return torch.einsum(
+        "boh,bh->bo",
+        reshaped,
+        task_one_hot,
+    )
+
+
+class ClonExMLP(nn.Module):
+    """Shared MLP matching the ClonEx-SAC architecture."""
 
     def __init__(
         self,
@@ -66,20 +111,17 @@ class ClonExMLP(nn.Module):
 
         if input_dim <= 0:
             raise ValueError("input_dim must be positive.")
-
         if not hidden_sizes:
             raise ValueError("hidden_sizes must contain at least one layer.")
-
         if any(size <= 0 for size in hidden_sizes):
             raise ValueError("All hidden layer sizes must be positive.")
 
-        self.input_dim = input_dim
-        self.hidden_sizes = tuple(hidden_sizes)
-        self.use_layer_norm = use_layer_norm
+        self.input_dim = int(input_dim)
+        self.hidden_sizes = tuple(int(size) for size in hidden_sizes)
 
         self.hidden_layers = nn.ModuleList()
+        previous_dim = self.input_dim
 
-        previous_dim = input_dim
         for hidden_dim in self.hidden_sizes:
             layer = nn.Linear(previous_dim, hidden_dim)
             initialize_linear_layer(layer)
@@ -87,9 +129,11 @@ class ClonExMLP(nn.Module):
             previous_dim = hidden_dim
 
         self.first_layer_norm: nn.LayerNorm | None
-
         if use_layer_norm:
-            self.first_layer_norm = nn.LayerNorm(self.hidden_sizes[0])
+            self.first_layer_norm = nn.LayerNorm(
+                self.hidden_sizes[0],
+                eps=LAYER_NORM_EPSILON,
+            )
         else:
             self.first_layer_norm = None
 
@@ -99,17 +143,15 @@ class ClonExMLP(nn.Module):
 
     @property
     def output_dim(self) -> int:
-        """Return the size of the final hidden representation."""
+        """Return the final shared representation size."""
         return self.hidden_sizes[-1]
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Encode a batch of input vectors."""
+        """Encode a batch of vectors."""
         if inputs.ndim != 2:
             raise ValueError(
-                "ClonExMLP expects a rank-2 tensor with shape "
-                f"(batch_size, input_dim), received {tuple(inputs.shape)}."
+                "ClonExMLP expects shape (batch_size, input_dim)."
             )
-
         if inputs.shape[-1] != self.input_dim:
             raise ValueError(
                 f"Expected input dimension {self.input_dim}, "
@@ -117,13 +159,10 @@ class ClonExMLP(nn.Module):
             )
 
         x = inputs
-
         for layer_index, layer in enumerate(self.hidden_layers):
             x = layer(x)
 
             if layer_index == 0 and self.first_layer_norm is not None:
-                # This slightly unusual tanh after the first LayerNorm
-                # exactly follows the ClonEx-SAC reference MLP.
                 x = self.first_layer_norm(x)
                 x = torch.tanh(x)
             else:
@@ -133,12 +172,7 @@ class ClonExMLP(nn.Module):
 
 
 class GaussianActor(nn.Module):
-    """Squashed Gaussian actor used by SAC.
-
-    The network produces a Gaussian mean and log standard deviation.
-    Actions are sampled with the reparameterization trick, passed through
-    tanh, and scaled to the environment action range.
-    """
+    """Multi-head squashed-Gaussian actor used by ClonEx-SAC."""
 
     def __init__(
         self,
@@ -147,52 +181,67 @@ class GaussianActor(nn.Module):
         action_high: np.ndarray,
         hidden_sizes: Sequence[int] = DEFAULT_HIDDEN_SIZES,
         use_layer_norm: bool = True,
+        task_id_dim: int = 0,
+        num_heads: int = 1,
     ) -> None:
         super().__init__()
 
         if observation_dim <= 0:
             raise ValueError("observation_dim must be positive.")
+        if task_id_dim < 0:
+            raise ValueError("task_id_dim must be non-negative.")
+        if task_id_dim >= observation_dim:
+            raise ValueError(
+                "task_id_dim must be smaller than observation_dim."
+            )
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive.")
+        if num_heads > 1 and task_id_dim != num_heads:
+            raise ValueError(
+                "For multi-head actor, task_id_dim must equal num_heads."
+            )
 
         action_low_array = np.asarray(action_low, dtype=np.float32)
         action_high_array = np.asarray(action_high, dtype=np.float32)
 
         if action_low_array.ndim != 1:
-            raise ValueError("action_low must be a one-dimensional array.")
-
+            raise ValueError("action_low must be one-dimensional.")
         if action_high_array.shape != action_low_array.shape:
             raise ValueError(
                 "action_low and action_high must have identical shapes."
             )
-
         if not np.all(np.isfinite(action_low_array)):
             raise ValueError("action_low must contain finite values.")
-
         if not np.all(np.isfinite(action_high_array)):
             raise ValueError("action_high must contain finite values.")
-
         if not np.all(action_high_array > action_low_array):
             raise ValueError(
                 "Every action_high value must be greater than action_low."
             )
 
-        self.observation_dim = observation_dim
+        self.observation_dim = int(observation_dim)
+        self.task_id_dim = int(task_id_dim)
+        self.num_heads = int(num_heads)
         self.action_dim = int(action_low_array.shape[0])
 
+        physical_observation_dim = (
+            self.observation_dim - self.task_id_dim
+        )
+
         self.backbone = ClonExMLP(
-            input_dim=observation_dim,
+            input_dim=physical_observation_dim,
             hidden_sizes=hidden_sizes,
             use_layer_norm=use_layer_norm,
         )
 
         self.mean_head = nn.Linear(
             self.backbone.output_dim,
-            self.action_dim,
+            self.action_dim * self.num_heads,
         )
         self.log_std_head = nn.Linear(
             self.backbone.output_dim,
-            self.action_dim,
+            self.action_dim * self.num_heads,
         )
-
         initialize_linear_layer(self.mean_head)
         initialize_linear_layer(self.log_std_head)
 
@@ -208,64 +257,97 @@ class GaussianActor(nn.Module):
             torch.as_tensor(action_bias, dtype=torch.float32),
         )
 
+    def _split_observation(
+        self,
+        observations: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if observations.ndim != 2:
+            raise ValueError("observations must be a rank-2 tensor.")
+        if observations.shape[-1] != self.observation_dim:
+            raise ValueError(
+                f"Expected observation dimension {self.observation_dim}, "
+                f"received {observations.shape[-1]}."
+            )
+
+        if self.task_id_dim == 0:
+            return observations, None
+
+        physical = observations[:, :-self.task_id_dim]
+        task_one_hot = observations[:, -self.task_id_dim:]
+        return physical, task_one_hot
+
     def distribution_parameters(
         self,
         observations: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the Gaussian mean and bounded log standard deviation."""
-        features = self.backbone(observations)
+        """Return the active head's Gaussian parameters."""
+        physical_observations, task_one_hot = (
+            self._split_observation(observations)
+        )
+        features = self.backbone(physical_observations)
 
-        mean = self.mean_head(features)
-        log_std = self.log_std_head(features)
+        all_means = self.mean_head(features)
+        all_log_stds = self.log_std_head(features)
+
+        if self.num_heads > 1:
+            if task_one_hot is None:
+                raise RuntimeError(
+                    "Multi-head actor requires a task one-hot vector."
+                )
+            mean = choose_task_head(
+                all_means,
+                task_one_hot,
+                self.num_heads,
+            )
+            log_std = choose_task_head(
+                all_log_stds,
+                task_one_hot,
+                self.num_heads,
+            )
+        else:
+            mean = all_means
+            log_std = all_log_stds
+
         log_std = torch.clamp(
             log_std,
             min=LOG_STD_MIN,
             max=LOG_STD_MAX,
         )
-
         return mean, log_std
 
     def sample(
         self,
         observations: torch.Tensor,
     ) -> ActorOutput:
-        """Sample differentiable actions and calculate their log probability."""
+        """Sample differentiable actions and calculate log probability."""
         mean, log_std = self.distribution_parameters(observations)
-        std = log_std.exp()
+        distribution = Normal(mean, log_std.exp())
 
-        distribution = Normal(mean, std)
-
-        # rsample() uses the reparameterization trick required for the
-        # SAC actor gradient.
         pre_tanh_action = distribution.rsample()
-
         squashed_sample = torch.tanh(pre_tanh_action)
         squashed_mean = torch.tanh(mean)
 
         sampled_action = (
-            squashed_sample * self.action_scale
-            + self.action_bias
+            squashed_sample * self.action_scale + self.action_bias
         )
         mean_action = (
-            squashed_mean * self.action_scale
-            + self.action_bias
+            squashed_mean * self.action_scale + self.action_bias
         )
 
-        # Gaussian log probability before tanh transformation.
-        log_probability = distribution.log_prob(pre_tanh_action)
-
-        # Correct the density for tanh and action scaling.
-        correction = torch.log(
-            self.action_scale
-            * (1.0 - squashed_sample.pow(2))
-            + LOG_PROB_EPSILON
+        gaussian_log_probability = distribution.log_prob(
+            pre_tanh_action
+        )
+        tanh_correction = 2.0 * (
+            math.log(2.0)
+            - pre_tanh_action
+            - torch.nn.functional.softplus(-2.0 * pre_tanh_action)
         )
 
-        log_probability = log_probability - correction
-        log_probability = log_probability.sum(
-            dim=-1,
-            keepdim=True,
-        )
+        log_probability = (
+            gaussian_log_probability
+            - tanh_correction
+            - torch.log(self.action_scale)
+        ).sum(dim=-1, keepdim=True)
 
         return ActorOutput(
             mean_action=mean_action,
@@ -281,16 +363,16 @@ class GaussianActor(nn.Module):
         deterministic: bool,
         device: torch.device | str,
     ) -> np.ndarray:
-        """Return one NumPy action for environment interaction."""
+        """Return one action for environment interaction."""
         observation_array = np.asarray(
             observation,
             dtype=np.float32,
         )
+        expected_shape = (self.observation_dim,)
 
-        if observation_array.shape != (self.observation_dim,):
+        if observation_array.shape != expected_shape:
             raise ValueError(
-                "Invalid observation shape: expected "
-                f"{(self.observation_dim,)}, "
+                f"Expected observation shape {expected_shape}, "
                 f"received {observation_array.shape}."
             )
 
@@ -300,22 +382,17 @@ class GaussianActor(nn.Module):
             device=device,
         ).unsqueeze(0)
 
-        actor_output = self.sample(observation_tensor)
-
-        if deterministic:
-            action = actor_output.mean_action
-        else:
-            action = actor_output.sampled_action
-
+        output = self.sample(observation_tensor)
+        action = (
+            output.mean_action
+            if deterministic
+            else output.sampled_action
+        )
         return action.squeeze(0).cpu().numpy()
 
 
 class QCritic(nn.Module):
-    """Single Q-function for SAC.
-
-    SAC will later instantiate two independent QCritic networks to form
-    the twin-critic architecture.
-    """
+    """Multi-head Q-function used as one SAC critic."""
 
     def __init__(
         self,
@@ -323,27 +400,46 @@ class QCritic(nn.Module):
         action_dim: int,
         hidden_sizes: Sequence[int] = DEFAULT_HIDDEN_SIZES,
         use_layer_norm: bool = True,
+        task_id_dim: int = 0,
+        num_heads: int = 1,
     ) -> None:
         super().__init__()
 
         if observation_dim <= 0:
             raise ValueError("observation_dim must be positive.")
-
         if action_dim <= 0:
             raise ValueError("action_dim must be positive.")
+        if task_id_dim < 0:
+            raise ValueError("task_id_dim must be non-negative.")
+        if task_id_dim >= observation_dim:
+            raise ValueError(
+                "task_id_dim must be smaller than observation_dim."
+            )
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive.")
+        if num_heads > 1 and task_id_dim != num_heads:
+            raise ValueError(
+                "For multi-head critic, task_id_dim must equal num_heads."
+            )
 
-        self.observation_dim = observation_dim
-        self.action_dim = action_dim
+        self.observation_dim = int(observation_dim)
+        self.action_dim = int(action_dim)
+        self.task_id_dim = int(task_id_dim)
+        self.num_heads = int(num_heads)
+
+        physical_observation_dim = (
+            self.observation_dim - self.task_id_dim
+        )
 
         self.backbone = ClonExMLP(
-            input_dim=observation_dim + action_dim,
+            input_dim=physical_observation_dim + self.action_dim,
             hidden_sizes=hidden_sizes,
             use_layer_norm=use_layer_norm,
         )
 
         self.q_head = nn.Linear(
             self.backbone.output_dim,
-            1,
+            self.num_heads,
         )
         initialize_linear_layer(self.q_head)
 
@@ -352,36 +448,52 @@ class QCritic(nn.Module):
         observations: torch.Tensor,
         actions: torch.Tensor,
     ) -> torch.Tensor:
-        """Estimate Q(s, a) for a batch of transitions."""
+        """Estimate the active task head's Q(s, a)."""
         if observations.ndim != 2:
             raise ValueError("observations must be a rank-2 tensor.")
-
         if actions.ndim != 2:
             raise ValueError("actions must be a rank-2 tensor.")
-
         if observations.shape[0] != actions.shape[0]:
             raise ValueError(
                 "observations and actions must have the same batch size."
             )
-
         if observations.shape[-1] != self.observation_dim:
             raise ValueError(
                 f"Expected observation dimension {self.observation_dim}, "
                 f"received {observations.shape[-1]}."
             )
-
         if actions.shape[-1] != self.action_dim:
             raise ValueError(
                 f"Expected action dimension {self.action_dim}, "
                 f"received {actions.shape[-1]}."
             )
 
-        inputs = torch.cat(
-            (observations, actions),
-            dim=-1,
-        )
+        if self.task_id_dim == 0:
+            physical_observations = observations
+            task_one_hot = None
+        else:
+            physical_observations = observations[:, :-self.task_id_dim]
+            task_one_hot = observations[:, -self.task_id_dim:]
 
-        features = self.backbone(inputs)
-        q_values = self.q_head(features)
+        features = self.backbone(
+            torch.cat(
+                (physical_observations, actions),
+                dim=-1,
+            )
+        )
+        all_q_values = self.q_head(features)
+
+        if self.num_heads > 1:
+            if task_one_hot is None:
+                raise RuntimeError(
+                    "Multi-head critic requires a task one-hot vector."
+                )
+            q_values = choose_task_head(
+                all_q_values,
+                task_one_hot,
+                self.num_heads,
+            )
+        else:
+            q_values = all_q_values
 
         return q_values
