@@ -2,7 +2,8 @@ import unittest
 
 import numpy as np
 
-from crl_cw.evaluation import (
+from evaluation import (
+    compute_area_forward_transfer,
     compute_continual_metrics,
     compute_end_of_task_performance,
     compute_final_task_performance,
@@ -318,7 +319,104 @@ class TestContinualMetrics(unittest.TestCase):
                 "average_forgetting",
                 "forward_transfer",
                 "raw_forward_transfer",
+                "area_forward_transfer",
             },
+        )
+
+    def test_area_forward_transfer_matches_trapezoid_formula(
+        self,
+    ) -> None:
+        result = compute_area_forward_transfer(
+            active_task_success_curves=[
+                [
+                    0.0,
+                    0.6,
+                    1.0,
+                ],
+            ],
+            baseline_success_curves=[
+                [
+                    0.0,
+                    0.2,
+                    0.4,
+                ],
+            ],
+        )
+
+        # Numerator:
+        # trapz([0.0, 0.4, 0.6]) = 0.7
+        #
+        # Denominator:
+        # trapz([1.0, 0.8, 0.6]) = 1.6
+        #
+        # area FT = 0.7 / 1.6 = 0.4375
+        self.assertAlmostEqual(
+            result[0],
+            0.4375,
+            places=7,
+        )
+
+    def test_complete_metric_summary_includes_area_forward_transfer(
+        self,
+    ) -> None:
+        result = compute_continual_metrics(
+            final_evaluation_successes=[
+                [
+                    0.6,
+                    0.2,
+                ],
+                [
+                    0.8,
+                    0.4,
+                ],
+                [
+                    1.0,
+                    0.6,
+                ],
+            ],
+            active_task_success_curves=[
+                [
+                    0.1,
+                    0.5,
+                    0.9,
+                    1.0,
+                    0.9,
+                ],
+                [
+                    0.0,
+                    0.2,
+                    0.6,
+                    0.8,
+                    0.7,
+                ],
+            ],
+            baseline_success_curves=[
+                [
+                    0.0,
+                    0.2,
+                    0.4,
+                    0.6,
+                    0.8,
+                ],
+                [
+                    0.0,
+                    0.1,
+                    0.2,
+                    0.3,
+                    0.4,
+                ],
+            ],
+            tail_size=2,
+        )
+
+        self.assertEqual(
+            len(result.area_forward_transfer_per_task),
+            2,
+        )
+        self.assertTrue(
+            np.isfinite(
+                result.average_area_forward_transfer
+            )
         )
 
     def test_negative_forgetting_is_not_clipped(
@@ -400,6 +498,27 @@ class TestContinualMetrics(unittest.TestCase):
             ValueError
         ):
             compute_forward_transfer(
+                active_task_success_curves=[
+                    [
+                        1.0,
+                        1.0,
+                    ],
+                ],
+                baseline_success_curves=[
+                    [
+                        1.0,
+                        1.0,
+                    ],
+                ],
+            )
+
+    def test_zero_headroom_area_is_rejected(
+        self,
+    ) -> None:
+        with self.assertRaises(
+            ValueError
+        ):
+            compute_area_forward_transfer(
                 active_task_success_curves=[
                     [
                         1.0,

@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from crl_cw.agents import (
+from agents import (
     compute_actor_loss,
     compute_alpha_loss,
     compute_critic_losses,

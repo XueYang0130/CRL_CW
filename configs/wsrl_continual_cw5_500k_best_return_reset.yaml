@@ -1,0 +1,39 @@
+mode: continual
+method: wsrl_continual
+run_name: wsrl_continual_cw5_500k_best_return_reset_seed0
+output_dir: outputs/wsrl_continual
+
+seed: 0
+device: mps
+env_version: v3
+
+sequence_task_count: 5
+steps_per_task: 500000
+eval_every: 50000
+det_eval_episodes: 0
+stoch_eval_episodes: 5
+best_return_eval_episodes: 5
+
+batch_size: 128
+replay_size: 1000000
+
+start_steps: 10000
+update_after: 1000
+update_every: 50
+
+learning_rate: 0.001
+gamma: 0.99
+polyak: 0.995
+target_output_std: 0.089
+initial_log_alpha: 1.0
+max_episode_steps: 200
+
+exploration_strategy: random
+reset_buffer_on_task_change: true
+reset_optimizer_on_task_change: true
+
+baseline_curves: outputs/single_task_baselines/single_task_baseline_cw5_500k_seed0/aggregate/baseline_curves.json
+wsrl_backbone_source: best_return
+wsrl_head_source: reset
+wsrl_warmup_steps: 10000
+tail_size: 5

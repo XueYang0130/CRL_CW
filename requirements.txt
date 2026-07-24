@@ -6,4 +6,3 @@ metaworld==3.1.1
 pytest==8.3.5
 pyyaml==6.0.2
 tqdm==4.67.1
-wandb>=0.26,<0.27

@@ -1,0 +1,29 @@
+mode: single-batch
+method: single_task_baseline
+run_name: single_task_baseline_cw5_500k_seed0
+output_dir: outputs/single_task_baselines
+
+seed: 0
+device: mps
+env_version: v3
+
+num_tasks: 5
+steps_per_task: 500000
+eval_every: 20000
+det_eval_episodes: 0
+stoch_eval_episodes: 5
+
+batch_size: 128
+replay_size: 1000000
+start_steps: 10000
+update_after: 1000
+update_every: 50
+
+learning_rate: 0.001
+gamma: 0.99
+polyak: 0.995
+target_output_std: 0.089
+initial_log_alpha: 1.0
+max_episode_steps: 200
+
+aggregate_tail_size: 5

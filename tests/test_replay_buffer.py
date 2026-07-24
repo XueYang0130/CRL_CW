@@ -14,8 +14,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from crl_cw.agents import ReplayBuffer
-from crl_cw.envs import make_cw_env
+from agents import ReplayBuffer
+from envs import make_cw_env
 
 
 class TestReplayBuffer(unittest.TestCase):
@@ -119,7 +119,7 @@ class TestReplayBuffer(unittest.TestCase):
 
     def test_real_environment_dimensions_are_supported(self) -> None:
         """Verify compatibility with the actual MetaWorld observation/action size."""
-        env = make_cw_env("hammer-v1", seed=0)
+        env = make_cw_env("hammer-v3", seed=0)
 
         try:
             observation, _ = env.reset(seed=0)

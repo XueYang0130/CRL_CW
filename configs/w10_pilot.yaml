@@ -1,0 +1,36 @@
+mode: continual
+method: fine_tuning
+run_name: w10_pilot
+output_dir: outputs/cw10_pilot
+
+seed: 0
+device: cpu
+env_version: v3
+
+sequence_task_count: 10
+steps_per_task: 50000
+eval_every: 5000
+det_eval_episodes: 1
+stoch_eval_episodes: 10
+best_return_eval_episodes: 2
+
+batch_size: 128
+replay_size: 1000000
+
+start_steps: 5000
+update_after: 1000
+update_every: 50
+
+learning_rate: 0.001
+gamma: 0.99
+polyak: 0.995
+target_output_std: 0.089
+initial_log_alpha: 1.0
+max_episode_steps: 200
+
+exploration_strategy: random
+reset_buffer_on_task_change: true
+reset_optimizer_on_task_change: true
+
+baseline_curves: null
+tail_size: 5

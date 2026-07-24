@@ -11,20 +11,20 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from crl_cw.envs.tasks import CW10_TASKS, get_cw10_tasks
+from envs import CW10_TASKS, get_cw10_tasks
 
 
 EXPECTED_CW10_TASKS = (
-    "hammer-v1",
-    "push-wall-v1",
-    "faucet-close-v1",
-    "push-back-v1",
-    "stick-pull-v1",
-    "handle-press-side-v1",
-    "push-v1",
-    "shelf-place-v1",
-    "window-close-v1",
-    "peg-unplug-side-v1",
+    "hammer-v3",
+    "push-wall-v3",
+    "faucet-close-v3",
+    "push-back-v3",
+    "stick-pull-v3",
+    "handle-press-side-v3",
+    "push-v3",
+    "shelf-place-v3",
+    "window-close-v3",
+    "peg-unplug-side-v3",
 )
 
 

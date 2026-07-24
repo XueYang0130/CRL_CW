@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from crl_cw.evaluation import (
+from evaluation import (
     EvaluationConfig,
     EvaluationResult,
     SACEvaluator,

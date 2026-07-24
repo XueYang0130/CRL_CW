@@ -4,7 +4,7 @@ import unittest
 import numpy as np
 import torch
 
-from crl_cw.agents import SACAgent
+from agents import SACAgent
 
 
 OBSERVATION_DIM = 39
@@ -86,7 +86,7 @@ class TestSACAgent(unittest.TestCase):
     def test_default_entropy_configuration(
         self,
     ) -> None:
-        """Check CloneX-compatible automatic entropy defaults."""
+        """Check automatic entropy defaults."""
         self.assertEqual(
             self.agent.target_entropy,
             -float(ACTION_DIM),

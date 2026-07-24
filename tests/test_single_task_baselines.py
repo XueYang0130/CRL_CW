@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from crl_cw.evaluation.single_task_baselines import (
+from evaluation.single_task_baselines import (
     aggregate_single_task_baselines,
 )
 
@@ -20,7 +20,7 @@ class SingleTaskBaselineAggregationTests(unittest.TestCase):
             runs_directory = batch_directory / "runs"
             runs_directory.mkdir(parents=True)
 
-            tasks = ["hammer-v1", "push-wall-v1"]
+            tasks = ["hammer-v3", "push-wall-v3"]
             batch_config = {
                 "tasks": tasks,
                 "seed": 0,
@@ -118,7 +118,7 @@ class SingleTaskBaselineAggregationTests(unittest.TestCase):
             batch_directory = Path(temporary_directory) / "batch"
             runs_directory = batch_directory / "runs"
             runs_directory.mkdir(parents=True)
-            tasks = ["hammer-v1", "push-wall-v1"]
+            tasks = ["hammer-v3", "push-wall-v3"]
 
             self._write_json(
                 batch_directory / "batch_config.json",

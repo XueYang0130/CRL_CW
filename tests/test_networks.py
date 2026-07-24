@@ -1,4 +1,4 @@
-"""Unit tests for the ClonEx-compatible SAC networks."""
+"""Unit tests for the SAC networks."""
 
 import sys
 import unittest
@@ -14,14 +14,14 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from crl_cw.agents import (
+from agents import (
     DEFAULT_HIDDEN_SIZES,
     LOG_STD_MAX,
     LOG_STD_MIN,
     GaussianActor,
     QCritic,
 )
-from crl_cw.envs import make_cw_env
+from envs import make_cw_env
 
 
 class TestSACNetworks(unittest.TestCase):
@@ -51,7 +51,7 @@ class TestSACNetworks(unittest.TestCase):
             action_dim=self.action_dim,
         )
 
-    def test_default_architecture_matches_clonex(self) -> None:
+    def test_default_architecture(self) -> None:
         self.assertEqual(
             DEFAULT_HIDDEN_SIZES,
             (256, 256, 256, 256),
@@ -172,7 +172,7 @@ class TestSACNetworks(unittest.TestCase):
         )
 
     def test_real_metaworld_dimensions(self) -> None:
-        env = make_cw_env("hammer-v1", seed=0)
+        env = make_cw_env("hammer-v3", seed=0)
 
         try:
             observation, _ = env.reset(seed=0)

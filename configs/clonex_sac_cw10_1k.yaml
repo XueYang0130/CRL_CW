@@ -1,0 +1,30 @@
+mode: continual
+method: clonex_sac
+run_name: clonex_sac_cw10_1k
+output_dir: outputs/clonex_sac
+
+seed: 0
+device: cpu
+env_version: v3
+
+sequence_task_count: 10
+steps_per_task: 1000
+eval_every: 1000
+det_eval_episodes: 0
+stoch_eval_episodes: 1
+
+batch_size: 128
+replay_size: 50000
+
+start_steps: 100
+update_after: 100
+update_every: 50
+
+learning_rate: 0.001
+gamma: 0.99
+polyak: 0.995
+target_output_std: 0.089
+initial_log_alpha: 1.0
+max_episode_steps: 200
+
+tail_size: 1

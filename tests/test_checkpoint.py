@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from crl_cw.agents import SACAgent
-from crl_cw.utils import (
+from agents import SACAgent
+from utils import (
     CHECKPOINT_VERSION,
     load_sac_checkpoint,
     save_sac_checkpoint,
@@ -108,7 +108,7 @@ class TestSACCheckpoint(unittest.TestCase):
                 path=checkpoint_path,
                 environment_step=12_345,
                 metadata={
-                    "task_name": "hammer-v1",
+                    "task_name": "hammer-v3",
                     "seed": 7,
                 },
             )
@@ -139,7 +139,7 @@ class TestSACCheckpoint(unittest.TestCase):
             self.assertEqual(
                 info.metadata,
                 {
-                    "task_name": "hammer-v1",
+                    "task_name": "hammer-v3",
                     "seed": 7,
                 },
             )

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from crl_cw.training import (
+from training import (
     SACTrainer,
     SACTrainerConfig,
 )
@@ -284,6 +284,7 @@ class FakeAgent:
         self,
     ) -> None:
         self.policy_action_count = 0
+        self.guide_action_count = 0
         self.update_count = 0
 
     def select_action(
@@ -312,6 +313,22 @@ class FakeAgent:
             0.25,
             dtype=np.float32,
         )
+
+    def select_guide_action(
+        self,
+        observation: np.ndarray,
+        *,
+        guide_task_index: int,
+        deterministic: bool = False,
+    ) -> np.ndarray:
+        if observation.shape != (OBSERVATION_DIM,):
+            raise AssertionError("Trainer supplied invalid observation.")
+        if guide_task_index != 0:
+            raise AssertionError("Trainer supplied invalid guide task.")
+        if deterministic:
+            raise AssertionError("Training must use stochastic guide actions.")
+        self.guide_action_count += 1
+        return np.full(ACTION_DIM, 0.75, dtype=np.float32)
 
     def update_batch(
         self,
@@ -376,6 +393,38 @@ class FakeAgent:
 
 
 class TestSACTrainer(unittest.TestCase):
+    def test_guide_controls_only_the_configured_episode_prefix(self) -> None:
+        env = FakeEnvironment()
+        agent = FakeAgent()
+        replay_buffer = FakeReplayBuffer()
+        trainer = SACTrainer(
+            env=env,
+            agent=agent,
+            replay_buffer=replay_buffer,
+            config=SACTrainerConfig(
+                total_steps=8,
+                batch_size=2,
+                start_steps=100,
+                update_after=100,
+                update_every=2,
+                max_episode_steps=4,
+                guide_head_index=0,
+                guide_steps=2,
+            ),
+        )
+
+        trainer.train()
+
+        self.assertEqual(agent.guide_action_count, 4)
+        self.assertEqual(agent.policy_action_count, 4)
+        self.assertEqual(env.action_space.sample_count, 0)
+        guide_actions = [
+            transition[1]
+            for transition in replay_buffer.transitions
+            if np.all(transition[1] == 0.75)
+        ]
+        self.assertEqual(len(guide_actions), 4)
+
     def test_action_and_update_schedule(
         self,
     ) -> None:
