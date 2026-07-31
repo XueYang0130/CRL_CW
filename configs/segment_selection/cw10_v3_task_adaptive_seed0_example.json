@@ -1,0 +1,121 @@
+{
+  "segment_order": [
+    "approach",
+    "contact_or_alignment",
+    "manipulation",
+    "finish_or_stabilize"
+  ],
+  "default_segments": [
+    "contact_or_alignment",
+    "manipulation"
+  ],
+  "pairs": {
+    "hammer-v3->push-wall-v3": {
+      "selected_segments": [
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "priority": [
+        "manipulation",
+        "contact_or_alignment"
+      ],
+      "reason": "Example placeholder selection for pair-specific semantic preservation."
+    },
+    "push-wall-v3->faucet-close-v3": {
+      "selected_segments": [
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "priority": [
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "reason": "Example placeholder selection for pair-specific semantic preservation."
+    },
+    "faucet-close-v3->push-back-v3": {
+      "selected_segments": [
+        "approach",
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "priority": [
+        "contact_or_alignment",
+        "manipulation",
+        "approach"
+      ],
+      "reason": "Example placeholder selection for pair-specific semantic preservation."
+    },
+    "push-back-v3->stick-pull-v3": {
+      "selected_segments": [
+        "approach",
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "priority": [
+        "approach",
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "reason": "Example placeholder selection for a harder multi-stage transfer pair."
+    },
+    "stick-pull-v3->handle-press-side-v3": {
+      "selected_segments": [
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "priority": [
+        "manipulation",
+        "contact_or_alignment"
+      ],
+      "reason": "Example placeholder selection for pair-specific semantic preservation."
+    },
+    "handle-press-side-v3->push-v3": {
+      "selected_segments": [
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "priority": [
+        "manipulation",
+        "contact_or_alignment"
+      ],
+      "reason": "Example placeholder selection for pair-specific semantic preservation."
+    },
+    "push-v3->shelf-place-v3": {
+      "selected_segments": [
+        "contact_or_alignment",
+        "manipulation",
+        "finish_or_stabilize"
+      ],
+      "priority": [
+        "manipulation",
+        "finish_or_stabilize",
+        "contact_or_alignment"
+      ],
+      "reason": "Example placeholder selection for pair-specific semantic preservation."
+    },
+    "shelf-place-v3->window-close-v3": {
+      "selected_segments": [
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "priority": [
+        "contact_or_alignment",
+        "manipulation"
+      ],
+      "reason": "Example placeholder selection for pair-specific semantic preservation."
+    },
+    "window-close-v3->peg-unplug-side-v3": {
+      "selected_segments": [
+        "contact_or_alignment",
+        "manipulation",
+        "finish_or_stabilize"
+      ],
+      "priority": [
+        "contact_or_alignment",
+        "manipulation",
+        "finish_or_stabilize"
+      ],
+      "reason": "Example placeholder selection for pair-specific semantic preservation."
+    }
+  }
+}

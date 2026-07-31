@@ -1,8 +1,14 @@
 from methods.base import MethodSpec
+from methods.adaptive_semantic_bc import METHOD as ADAPTIVE_SEMANTIC_BC
 from methods.clonex_sac import METHOD as CLONEX_SAC
+from methods.full_bc import METHOD as FULL_BC
+from methods.general_task_specific_bc import METHOD as GENERAL_TASK_SPECIFIC_BC
 from methods.jsrl_continual import METHOD as JSRL_CONTINUAL
 from methods.fine_tuning import METHOD as FINE_TUNING
 from methods.packnet import METHOD as PACKNET
+from methods.semantic_hybrid_bc import METHOD as SEMANTIC_HYBRID_BC
+from methods.semantic_local_bc import METHOD as SEMANTIC_LOCAL_BC
+from methods.stage_aware_semantic_bc import METHOD as STAGE_AWARE_SEMANTIC_BC
 from methods.task_conditioned import METHOD as TASK_CONDITIONED
 from methods.wsrl_continual import METHOD as WSRL_CONTINUAL
 
@@ -19,6 +25,12 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
         TASK_CONDITIONED,
         PACKNET,
         CLONEX_SAC,
+        FULL_BC,
+        SEMANTIC_LOCAL_BC,
+        SEMANTIC_HYBRID_BC,
+        STAGE_AWARE_SEMANTIC_BC,
+        ADAPTIVE_SEMANTIC_BC,
+        GENERAL_TASK_SPECIFIC_BC,
         JSRL_CONTINUAL,
         WSRL_CONTINUAL,
     )

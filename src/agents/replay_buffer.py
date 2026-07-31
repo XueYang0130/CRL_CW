@@ -60,6 +60,7 @@ class ReplayBuffer:
         self.observation_dim = observation_dim
         self.action_dim = action_dim
         self.capacity = capacity
+        self._rng = np.random.default_rng(seed)
 
         self._observations = np.empty(
             (capacity, observation_dim),
@@ -146,7 +147,7 @@ class ReplayBuffer:
         if self._size == 0:
             raise ValueError("Cannot sample from an empty replay buffer.")
 
-        indices = np.random.randint(
+        indices = self._rng.integers(
             0,
             self._size,
             size=batch_size,

@@ -87,6 +87,18 @@ class TestReplayBuffer(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.buffer.sample(batch_size=1, device="cpu")
 
+    def test_sampling_uses_the_buffer_seed(self) -> None:
+        first = ReplayBuffer(3, 2, capacity=5, seed=42)
+        second = ReplayBuffer(3, 2, capacity=5, seed=42)
+        for value in range(5):
+            observation = np.full(3, value, dtype=np.float32)
+            action = np.full(2, value, dtype=np.float32)
+            for buffer in (first, second):
+                buffer.add(observation, action, float(value), observation + 1, False)
+        first_batch = first.sample(20, "cpu")
+        second_batch = second.sample(20, "cpu")
+        self.assertTrue(torch.equal(first_batch.observations, second_batch.observations))
+
     def test_clear(self) -> None:
         self.add_transition(value=1.0)
         self.buffer.clear()

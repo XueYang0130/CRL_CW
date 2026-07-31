@@ -15,11 +15,13 @@ same evaluation environment may be reused multiple times.
 from __future__ import annotations
 
 import math
+import random
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import torch
 
 from envs.cw_env import extract_success
 
@@ -236,6 +238,15 @@ class SACEvaluator:
             None,
         )
 
+        # Stochastic evaluation must be reproducible without changing
+        # the random stream used by subsequent training updates.
+        python_rng_state = random.getstate()
+        numpy_rng_state = np.random.get_state()
+        torch_rng_state = torch.random.get_rng_state()
+        random.seed(self.config.seed)
+        np.random.seed(self.config.seed)
+        torch.manual_seed(self.config.seed)
+
         eval_method = getattr(
             self.agent,
             "eval",
@@ -331,6 +342,10 @@ class SACEvaluator:
                 )
 
         finally:
+            random.setstate(python_rng_state)
+            np.random.set_state(numpy_rng_state)
+            torch.random.set_rng_state(torch_rng_state)
+
             # Restore the exact previous nn.Module training mode.
             if previous_training_mode is not None:
                 train_method = getattr(

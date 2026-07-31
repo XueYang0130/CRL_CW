@@ -1,7 +1,9 @@
 import unittest
+import random
 from dataclasses import dataclass
 
 import numpy as np
+import torch
 
 from evaluation import (
     EvaluationConfig,
@@ -570,6 +572,31 @@ class TestSACEvaluator(
         self.assertTrue(
             agent.training
         )
+
+    def test_evaluation_restores_global_random_states(self) -> None:
+        """Evaluation must not perturb random streams used by training."""
+        random.seed(17)
+        np.random.seed(17)
+        torch.manual_seed(17)
+        expected_python = random.random()
+        expected_numpy = float(np.random.random())
+        expected_torch = float(torch.rand(()))
+
+        random.seed(17)
+        np.random.seed(17)
+        torch.manual_seed(17)
+        evaluator = SACEvaluator(
+            env=FakeEvaluationEnvironment(
+                episodes=[[FakeStep(reward=0.0, terminated=True)]]
+            ),
+            agent=FakeEvaluationAgent(),
+            config=EvaluationConfig(num_episodes=1, seed=91),
+        )
+        evaluator.evaluate(deterministic=False)
+
+        self.assertEqual(random.random(), expected_python)
+        self.assertEqual(float(np.random.random()), expected_numpy)
+        self.assertEqual(float(torch.rand(())), expected_torch)
 
     def test_default_evaluation_is_deterministic(
         self,

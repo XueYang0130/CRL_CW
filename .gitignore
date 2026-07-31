@@ -22,3 +22,8 @@ venv/
 
 # Experiment tracking
 wandb/
+
+# Local secrets
+.env
+.env.*
+!.env.example

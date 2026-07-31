@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import subprocess
 import sys
 import time
@@ -41,6 +42,23 @@ def load_config(path: str | Path) -> dict[str, object]:
     return dict(payload)
 
 
+def load_dotenv_values(path: str | Path) -> dict[str, str]:
+    dotenv_path = Path(path).expanduser().resolve()
+    if not dotenv_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            values[key] = value
+    return values
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default=None)
@@ -48,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--method", type=str, default=None)
     parser.add_argument("--task", type=str, default="hammer-v3")
     parser.add_argument("--env-version", choices=("v2", "v3"), default="v3")
+    parser.add_argument(
+        "--reward-function-version",
+        choices=("v1", "v2", "v1_compatible", "cw10_v1"),
+        default="v2",
+    )
     parser.add_argument("--steps-per-task", type=int, default=1_000_000)
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--sequence-task-count", type=int, default=10)
@@ -77,6 +100,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodic-memory-per-task", type=int, default=0)
     parser.add_argument("--episodic-batch-size", type=int, default=0)
     parser.add_argument("--actor-cloning-coefficient", type=float, default=0.0)
+    parser.add_argument("--full-bc-reference-episodes", type=int, default=20)
+    parser.add_argument("--full-bc-reference-max-attempts", type=int, default=80)
+    parser.add_argument("--semantic-segments", nargs="+", default=None)
+    parser.add_argument(
+        "--semantic-segment-scheme",
+        choices=("heuristic_v1", "task_aware_v2", "task_aware_v3"),
+        default="heuristic_v1",
+    )
+    parser.add_argument("--semantic-post-success-steps", type=int, default=10)
+    parser.add_argument("--background-segment-ratio", type=float, default=0.0)
+    parser.add_argument("--task-specific-segment-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--segment-selection-mode",
+        choices=("fixed", "task_adaptive", "llm_online"),
+        default="fixed",
+    )
+    parser.add_argument("--segment-selection-manifest", type=str, default=None)
+    parser.add_argument("--task-specific-segment-manifest", type=str, default=None)
+    parser.add_argument("--llm-controller-model", type=str, default="gpt-5")
+    parser.add_argument("--llm-controller-api-key-env", type=str, default="OPENAI_API_KEY")
+    parser.add_argument("--llm-controller-update-every-evals", type=int, default=1)
+    parser.add_argument("--llm-controller-max-output-tokens", type=int, default=400)
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
     parser.add_argument("--wsrl-backbone-source", choices=("current", "best_return"), default="current")
     parser.add_argument("--wsrl-head-source", choices=("reset", "current", "best_return"), default="reset")
@@ -93,11 +138,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--run-name", type=str, default=None)
     args = parser.parse_args()
-    parser_defaults = {
-        action.dest: action.default
+    explicit_destinations = {
+        action.dest
         for action in parser._actions
-        if action.dest != "help"
+        if any(
+            argument == option or argument.startswith(f"{option}=")
+            for argument in sys.argv[1:]
+            for option in action.option_strings
+        )
     }
+    dotenv_values = load_dotenv_values(PROJECT_ROOT / ".env")
+    env_model = (
+        os.environ.get("OPENAI_MODEL", "").strip()
+        or dotenv_values.get("OPENAI_MODEL", "").strip()
+    )
+    if env_model and "llm_controller_model" not in explicit_destinations:
+        args.llm_controller_model = env_model
 
     if args.config is not None:
         config = load_config(args.config)
@@ -105,7 +161,7 @@ def parse_args() -> argparse.Namespace:
         if unknown_keys:
             parser.error(f"Unknown config keys: {', '.join(sorted(unknown_keys))}")
         for key, value in config.items():
-            if getattr(args, key) == parser.get_default(key):
+            if key not in explicit_destinations:
                 setattr(args, key, value)
 
     if args.mode is None:
@@ -114,13 +170,55 @@ def parse_args() -> argparse.Namespace:
         args.method = default_method_for_mode(args.mode)
     if args.method not in available_method_ids():
         parser.error(f"Unsupported method '{args.method}'. Available methods: {', '.join(available_method_ids())}")
+    configured_keys = set(config) if args.config is not None else set()
     for key, value in method_defaults(args.method).items():
-        if getattr(args, key) == parser_defaults.get(key):
+        if key not in explicit_destinations and key not in configured_keys:
             setattr(args, key, value)
     if not is_method_compatible(args.mode, args.method):
         parser.error(f"Method '{args.method}' is not compatible with mode '{args.mode}'.")
     if args.total_steps is None:
         args.total_steps = args.steps_per_task
+    if args.semantic_segments is not None:
+        args.semantic_segments = list(args.semantic_segments)
+    if args.background_segment_ratio < 0.0:
+        parser.error("--background-segment-ratio must be non-negative.")
+    if args.task_specific_segment_ratio < 0.0:
+        parser.error("--task-specific-segment-ratio must be non-negative.")
+    if args.semantic_post_success_steps < 0:
+        parser.error("--semantic-post-success-steps must be non-negative.")
+    if args.llm_controller_update_every_evals <= 0:
+        parser.error("--llm-controller-update-every-evals must be positive.")
+    if not 1 <= args.sequence_task_count <= 10:
+        parser.error("--sequence-task-count must be between 1 and 10.")
+    if not 1 <= args.num_tasks <= 10:
+        parser.error("--num-tasks must be between 1 and 10.")
+    if args.steps_per_task <= 0 or args.total_steps <= 0:
+        parser.error("Training steps must be positive.")
+    if args.eval_every <= 0:
+        parser.error("--eval-every must be positive.")
+    if args.stoch_eval_episodes <= 0:
+        parser.error("--stoch-eval-episodes must be positive.")
+    if args.det_eval_episodes < 0:
+        parser.error("--det-eval-episodes must be non-negative.")
+    if args.tail_size <= 0 or args.aggregate_tail_size <= 0:
+        parser.error("Metric tail sizes must be positive.")
+    if (
+        args.task_specific_segment_ratio > 0.0
+        and args.task_specific_segment_manifest is None
+    ):
+        parser.error(
+            "--task-specific-segment-ratio requires "
+            "--task-specific-segment-manifest."
+        )
+    if args.segment_selection_mode == "llm_online" and args.mode != "continual":
+        parser.error("llm_online segment selection requires --mode continual.")
+    for option_name, path_value in (
+        ("--baseline-curves", args.baseline_curves),
+        ("--segment-selection-manifest", args.segment_selection_manifest),
+        ("--task-specific-segment-manifest", args.task_specific_segment_manifest),
+    ):
+        if path_value is not None and not Path(path_value).expanduser().is_file():
+            parser.error(f"{option_name} file does not exist: {path_value}")
     return args
 
 
@@ -170,6 +268,8 @@ def run_single_batch(args: argparse.Namespace) -> None:
             "method": args.method,
             "tasks": tasks,
             "seed": args.seed,
+            "env_version": args.env_version,
+            "reward_function_version": args.reward_function_version,
             "steps_per_task": args.steps_per_task,
             "eval_every": args.eval_every,
             "det_eval_episodes": args.det_eval_episodes,
@@ -193,6 +293,10 @@ def run_single_batch(args: argparse.Namespace) -> None:
             args.method,
             "--task",
             task_name,
+            "--env-version",
+            args.env_version,
+            "--reward-function-version",
+            args.reward_function_version,
             "--total-steps",
             str(args.steps_per_task),
             "--eval-every",

@@ -6,11 +6,32 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from agents import ReplayBuffer, SACAgent
+import numpy as np
+
+from agents import FullBehaviorCloningSACAgent, ReplayBuffer, SACAgent
 from envs import get_cw10_tasks, make_cw_env
 from evaluation import EvaluationConfig, SACEvaluator, summarize_continual_run
 from methods import get_method
-from training.sac_trainer import SACTrainer, SACTrainerConfig
+from training.sac_trainer import SACTrainer, SACTrainerConfig, seed_global_rngs
+from training.semantic_segments import (
+    SEGMENT_ORDER,
+    TaskAwareSegmenter,
+    TaskAwareV3Segmenter,
+    extract_features,
+    segment_label,
+)
+from training.segment_selection import (
+    SegmentSelection,
+    load_segment_selection_manifest,
+    select_task_specific_segments_for_task,
+    select_segments_for_task_pair,
+)
+from training.llm_controller import (
+    append_controller_log,
+    build_llm_gate_prompt,
+    call_openai_json_controller,
+    read_api_key,
+)
 from utils import save_sac_checkpoint, write_csv, write_json
 
 
@@ -58,7 +79,151 @@ CW10_TASK_SUMMARY_FIELDS = [
     "elapsed_seconds",
     "final_guide_steps",
     "curriculum_transitions",
+    "reference_success_episodes",
+    "reference_states",
+    "background_reference_states",
+    "task_specific_reference_states",
+    "semantic_segment_scheme",
+    "collected_segment_states",
+    "selected_segments",
+    "task_specific_segments",
+    "segment_priority",
+    "segment_selection_reason",
+    "segment_selection_source",
 ]
+
+STATIC_SEMANTIC_METHODS = {
+    "semantic_local_bc",
+    "adaptive_semantic_bc",
+    "general_task_specific_bc",
+    "semantic_hybrid_bc",
+}
+
+
+def stage_aware_segment_groups(progress_ratio: float) -> tuple[str, ...]:
+    if progress_ratio < 0.30:
+        return ("approach", "contact_or_alignment")
+    if progress_ratio < 0.70:
+        return ("contact_or_alignment", "manipulation")
+    return ("manipulation", "finish_or_stabilize")
+
+
+def combine_reference_payloads(
+    payloads: list[dict[str, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    non_empty_payloads = [
+        payload
+        for payload in payloads
+        if payload["observations"].shape[0] > 0
+    ]
+    if not non_empty_payloads:
+        return (
+            np.empty((0, 0), dtype=np.float32),
+            np.empty((0, 0), dtype=np.float32),
+            np.empty((0, 0), dtype=np.float32),
+        )
+    observations = np.concatenate(
+        [payload["observations"] for payload in non_empty_payloads],
+        axis=0,
+    )
+    target_means = np.concatenate(
+        [payload["target_means"] for payload in non_empty_payloads],
+        axis=0,
+    )
+    target_log_stds = np.concatenate(
+        [payload["target_log_stds"] for payload in non_empty_payloads],
+        axis=0,
+    )
+    return observations, target_means, target_log_stds
+
+
+def segment_payload_counts(
+    payload_store: dict[str, list[dict[str, np.ndarray]]],
+) -> dict[str, int]:
+    return {
+        segment: int(
+            sum(
+                payload["observations"].shape[0]
+                for payload in payload_store.get(segment, [])
+            )
+        )
+        for segment in SEGMENT_ORDER
+    }
+
+
+def selected_payloads_from_store(
+    *,
+    payload_store: dict[str, list[dict[str, np.ndarray]]],
+    selected_segments: tuple[str, ...],
+) -> list[dict[str, np.ndarray]]:
+    return [
+        payload
+        for segment in selected_segments
+        for payload in payload_store.get(segment, [])
+    ]
+
+
+def _sample_payload_states(
+    payloads: list[dict[str, np.ndarray]],
+    count: int,
+) -> dict[str, np.ndarray] | None:
+    observations, target_means, target_log_stds = combine_reference_payloads(payloads)
+    available = observations.shape[0]
+    if available == 0 or count <= 0:
+        return None
+    kept = min(count, available)
+    indices = np.linspace(0, available - 1, num=kept, dtype=int)
+    return {
+        "observations": observations[indices],
+        "target_means": target_means[indices],
+        "target_log_stds": target_log_stds[indices],
+    }
+
+
+def build_hybrid_memory_from_store(
+    *,
+    payload_store: dict[str, list[dict[str, np.ndarray]]],
+    selected_segments: tuple[str, ...],
+    priority: tuple[str, ...],
+    background_ratio: float,
+    task_specific_segments: tuple[str, ...] = (),
+    task_specific_ratio: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    if background_ratio < 0.0 or task_specific_ratio < 0.0:
+        raise ValueError("Hybrid memory ratios must be non-negative.")
+    selected = set(selected_segments)
+    task_specific = set(task_specific_segments).difference(selected)
+    priority_order = [segment for segment in priority if segment in selected]
+    priority_order.extend(segment for segment in selected_segments if segment not in priority_order)
+
+    general_payloads: list[dict[str, np.ndarray]] = []
+    for rank, segment in enumerate(priority_order):
+        repetitions = max(1, len(priority_order) - rank)
+        general_payloads.extend(payload_store.get(segment, []) * repetitions)
+    general_count = sum(payload["observations"].shape[0] for payload in general_payloads)
+
+    background_segments = set(SEGMENT_ORDER).difference(selected).difference(task_specific)
+    background_payload = _sample_payload_states(
+        [payload for segment in SEGMENT_ORDER if segment in background_segments for payload in payload_store[segment]],
+        int(round(general_count * background_ratio)),
+    )
+    task_specific_payload = _sample_payload_states(
+        [payload for segment in SEGMENT_ORDER if segment in task_specific for payload in payload_store[segment]],
+        int(round(general_count * task_specific_ratio)),
+    )
+    payloads = list(general_payloads)
+    if background_payload is not None:
+        payloads.append(background_payload)
+    if task_specific_payload is not None:
+        payloads.append(task_specific_payload)
+    observations, target_means, target_log_stds = combine_reference_payloads(payloads)
+    return (
+        observations,
+        target_means,
+        target_log_stds,
+        0 if background_payload is None else int(background_payload["observations"].shape[0]),
+        0 if task_specific_payload is None else int(task_specific_payload["observations"].shape[0]),
+    )
 
 
 def normalize_exploration_strategy(strategy: str) -> str:
@@ -73,7 +238,52 @@ def load_baseline_curves(path: str | None) -> list[list[float]] | None:
         return None
     with Path(path).open("r", encoding="utf-8") as file:
         payload = json.load(file)
-    return payload["stochastic_success_curves"]
+    if not isinstance(payload, dict):
+        raise ValueError("Baseline curve file must contain a JSON object.")
+    curves = payload.get("stochastic_success_curves")
+    if not isinstance(curves, list) or not all(
+        isinstance(curve, list) for curve in curves
+    ):
+        raise ValueError(
+            "Baseline curve file must contain a list-valued "
+            "stochastic_success_curves field."
+        )
+    return curves
+
+
+def validate_baseline_curves_for_run(
+    curves: list[list[float]] | None,
+    *,
+    task_count: int,
+    steps_per_task: int,
+    eval_every: int,
+) -> None:
+    if curves is None:
+        return
+    if len(curves) != task_count:
+        raise ValueError(
+            "Baseline curves must match the continual task count: "
+            f"expected {task_count}, got {len(curves)}."
+        )
+    expected_points = (steps_per_task + eval_every - 1) // eval_every
+    for task_index, curve in enumerate(curves):
+        if len(curve) != expected_points:
+            raise ValueError(
+                "Baseline curve length does not match the evaluation schedule: "
+                f"task={task_index}, expected={expected_points}, got={len(curve)}."
+            )
+        values = np.asarray(curve, dtype=np.float64)
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"Baseline curve {task_index} contains non-finite values.")
+        if np.any(values < 0.0) or np.any(values > 1.0):
+            raise ValueError(
+                f"Baseline curve {task_index} must contain success rates in [0, 1]."
+            )
+        if 1.0 - float(np.mean(values)) <= 1e-12:
+            raise ValueError(
+                "Normalized forward transfer is undefined because baseline "
+                f"curve {task_index} has no remaining success headroom."
+            )
 
 
 def select_best_return_guide(
@@ -213,6 +423,8 @@ def evaluate_all_tasks(
     started_at: float,
     update_metrics: dict[str, float] | None,
     append_task_id: bool,
+    reward_function_version: str,
+    num_task_ids: int,
     evaluation_task_indices: list[int] | None = None,
 ) -> list[dict[str, float | int | str]]:
     rows = []
@@ -230,6 +442,8 @@ def evaluate_all_tasks(
             max_episode_steps=max_episode_steps,
             append_task_id=append_task_id,
             env_version=env_version,
+            reward_function_version=reward_function_version,
+            num_task_ids=num_task_ids,
         )
         deterministic = None
         if det_eval_episodes > 0:
@@ -286,7 +500,377 @@ def evaluate_all_tasks(
     return rows
 
 
+def collect_successful_reference_observations(
+    *,
+    agent: SACAgent,
+    task_name: str,
+    env_version: str,
+    reward_function_version: str,
+    append_task_id: bool,
+    max_episode_steps: int,
+    episodes: int,
+    max_attempts: int,
+    seed: int,
+    num_task_ids: int,
+) -> tuple[np.ndarray, int]:
+    if episodes <= 0:
+        raise ValueError("full_bc_reference_episodes must be positive.")
+    if max_attempts <= 0:
+        raise ValueError("full_bc_reference_max_attempts must be positive.")
+    env = make_cw_env(
+        task_name,
+        seed=seed,
+        max_episode_steps=max_episode_steps,
+        append_task_id=append_task_id,
+        env_version=env_version,
+        reward_function_version=reward_function_version,
+        num_task_ids=num_task_ids,
+    )
+    kept_observations: list[np.ndarray] = []
+    successful_episodes = 0
+    attempts = 0
+    try:
+        while successful_episodes < episodes and attempts < max_attempts:
+            reset_result = env.reset(seed=seed + attempts)
+            observation = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+            episode_observations: list[np.ndarray] = []
+            episode_success = False
+            for _ in range(max_episode_steps):
+                episode_observations.append(np.asarray(observation, dtype=np.float32).copy())
+                step_result = env.step(agent.select_action(observation, deterministic=True))
+                if len(step_result) == 5:
+                    observation, _, terminated, truncated, info = step_result
+                    done = bool(terminated or truncated)
+                else:
+                    observation, _, done, info = step_result
+                episode_success = episode_success or bool(info.get("success", 0.0))
+                if done:
+                    break
+            attempts += 1
+            if not episode_success:
+                continue
+            successful_episodes += 1
+            kept_observations.extend(episode_observations)
+    finally:
+        env.close()
+
+    if kept_observations:
+        return np.stack(kept_observations).astype(np.float32), successful_episodes
+    empty_env = make_cw_env(
+        task_name,
+        seed=seed,
+        max_episode_steps=max_episode_steps,
+        append_task_id=append_task_id,
+        env_version=env_version,
+        reward_function_version=reward_function_version,
+        num_task_ids=num_task_ids,
+    )
+    try:
+        observation_dim = int(empty_env.observation_space.shape[0])
+    finally:
+        empty_env.close()
+    return np.empty((0, observation_dim), dtype=np.float32), successful_episodes
+
+
+def collect_segmented_reference_observations(
+    *,
+    agent: SACAgent,
+    task_name: str,
+    env_version: str,
+    reward_function_version: str,
+    append_task_id: bool,
+    max_episode_steps: int,
+    episodes: int,
+    max_attempts: int,
+    seed: int,
+    allowed_segments: set[str],
+    background_segment_ratio: float = 0.0,
+    task_specific_segments: set[str] | None = None,
+    task_specific_segment_ratio: float = 0.0,
+    segment_scheme: str = "heuristic_v1",
+    post_success_steps: int = 10,
+    num_task_ids: int = 10,
+) -> tuple[np.ndarray, int, int, int]:
+    if not allowed_segments:
+        raise ValueError("semantic_local_bc requires at least one semantic segment.")
+    invalid_segments = sorted(allowed_segments.difference(SEGMENT_ORDER))
+    if invalid_segments:
+        raise ValueError(
+            f"Unsupported semantic segments: {', '.join(invalid_segments)}. "
+            f"Supported: {', '.join(SEGMENT_ORDER)}."
+        )
+    if background_segment_ratio < 0.0:
+        raise ValueError("background_segment_ratio must be non-negative.")
+    if task_specific_segment_ratio < 0.0:
+        raise ValueError("task_specific_segment_ratio must be non-negative.")
+    if post_success_steps < 0:
+        raise ValueError("post_success_steps must be non-negative.")
+    if task_specific_segments is None:
+        task_specific_segments = set()
+    invalid_task_specific = sorted(task_specific_segments.difference(SEGMENT_ORDER))
+    if invalid_task_specific:
+        raise ValueError(
+            f"Unsupported task-specific semantic segments: {', '.join(invalid_task_specific)}. "
+            f"Supported: {', '.join(SEGMENT_ORDER)}."
+        )
+    env = make_cw_env(
+        task_name,
+        seed=seed,
+        max_episode_steps=max_episode_steps,
+        append_task_id=append_task_id,
+        env_version=env_version,
+        reward_function_version=reward_function_version,
+        num_task_ids=num_task_ids,
+    )
+    selected_observations: list[np.ndarray] = []
+    background_observations: list[np.ndarray] = []
+    task_specific_observations: list[np.ndarray] = []
+    successful_episodes = 0
+    attempts = 0
+    try:
+        while successful_episodes < episodes and attempts < max_attempts:
+            reset_result = env.reset(seed=seed + attempts)
+            observation = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+            episode_rows: list[tuple[np.ndarray, str]] = []
+            episode_success = False
+            segmenter_v2 = TaskAwareSegmenter()
+            segmenter_v3 = TaskAwareV3Segmenter()
+            previous_object_position: np.ndarray | None = None
+            previous_action: np.ndarray | None = None
+            previous_info: dict[str, Any] | None = None
+            success_detected = False
+            collected_post_success_steps = 0
+            for _ in range(max_episode_steps):
+                if success_detected and post_success_steps == 0:
+                    break
+                features = extract_features(
+                    env,
+                    task_name,
+                    episode_success,
+                    previous_object_position=previous_object_position,
+                    action=previous_action,
+                    info=previous_info,
+                )
+                if segment_scheme == "heuristic_v1":
+                    label = segment_label(features)
+                elif segment_scheme == "task_aware_v2":
+                    label = segmenter_v2.label(features)
+                elif segment_scheme == "task_aware_v3":
+                    label = segmenter_v3.label(features).general
+                else:
+                    raise ValueError(f"Unsupported semantic segment scheme: {segment_scheme}")
+                episode_rows.append(
+                    (
+                        np.asarray(observation, dtype=np.float32).copy(),
+                        label,
+                    )
+                )
+                if success_detected:
+                    collected_post_success_steps += 1
+                    if collected_post_success_steps >= post_success_steps:
+                        break
+                previous_object_position = np.asarray(
+                    env.unwrapped._get_pos_objects(), dtype=np.float64
+                ).reshape(-1)[:3].copy()
+                previous_action = agent.select_action(observation, deterministic=True)
+                step_result = env.step(previous_action)
+                if len(step_result) == 5:
+                    observation, _, terminated, truncated, info = step_result
+                    done = bool(terminated or truncated)
+                else:
+                    observation, _, done, info = step_result
+                previous_info = info
+                episode_success = episode_success or bool(info.get("success", 0.0))
+                success_detected = success_detected or bool(info.get("success", 0.0))
+                if done:
+                    break
+            attempts += 1
+            if not episode_success:
+                continue
+            successful_episodes += 1
+            for observation_row, label in episode_rows:
+                if label in allowed_segments:
+                    selected_observations.append(observation_row)
+                elif label in task_specific_segments:
+                    task_specific_observations.append(observation_row)
+                else:
+                    background_observations.append(observation_row)
+    finally:
+        env.close()
+
+    kept_observations = list(selected_observations)
+    num_background_kept = 0
+    num_task_specific_kept = 0
+    if selected_observations and background_observations and background_segment_ratio > 0.0:
+        max_background = int(round(len(selected_observations) * background_segment_ratio))
+        if max_background > 0:
+            num_background_kept = min(max_background, len(background_observations))
+            sample_indices = np.linspace(
+                0,
+                len(background_observations) - 1,
+                num=num_background_kept,
+                dtype=int,
+            )
+            kept_observations.extend(background_observations[index] for index in sample_indices)
+    if selected_observations and task_specific_observations and task_specific_segment_ratio > 0.0:
+        max_task_specific = int(round(len(selected_observations) * task_specific_segment_ratio))
+        if max_task_specific > 0:
+            num_task_specific_kept = min(max_task_specific, len(task_specific_observations))
+            sample_indices = np.linspace(
+                0,
+                len(task_specific_observations) - 1,
+                num=num_task_specific_kept,
+                dtype=int,
+            )
+            kept_observations.extend(task_specific_observations[index] for index in sample_indices)
+
+    if kept_observations:
+        return (
+            np.stack(kept_observations).astype(np.float32),
+            successful_episodes,
+            num_background_kept,
+            num_task_specific_kept,
+        )
+    empty_env = make_cw_env(
+        task_name,
+        seed=seed,
+        max_episode_steps=max_episode_steps,
+        append_task_id=append_task_id,
+        env_version=env_version,
+        reward_function_version=reward_function_version,
+        num_task_ids=num_task_ids,
+    )
+    try:
+        observation_dim = int(empty_env.observation_space.shape[0])
+    finally:
+        empty_env.close()
+    return (
+        np.empty((0, observation_dim), dtype=np.float32),
+        successful_episodes,
+        num_background_kept,
+        num_task_specific_kept,
+    )
+
+
+def collect_reference_payloads_by_segment(
+    *,
+    agent: FullBehaviorCloningSACAgent,
+    task_name: str,
+    env_version: str,
+    reward_function_version: str,
+    append_task_id: bool,
+    max_episode_steps: int,
+    episodes: int,
+    max_attempts: int,
+    seed: int,
+    segment_scheme: str,
+    post_success_steps: int,
+    num_task_ids: int,
+) -> tuple[dict[str, dict[str, np.ndarray]], int]:
+    env = make_cw_env(
+        task_name,
+        seed=seed,
+        max_episode_steps=max_episode_steps,
+        append_task_id=append_task_id,
+        env_version=env_version,
+        reward_function_version=reward_function_version,
+        num_task_ids=num_task_ids,
+    )
+    segment_observations: dict[str, list[np.ndarray]] = {
+        segment: [] for segment in SEGMENT_ORDER
+    }
+    successful_episodes = 0
+    attempts = 0
+    if post_success_steps < 0:
+        raise ValueError("post_success_steps must be non-negative.")
+    try:
+        while successful_episodes < episodes and attempts < max_attempts:
+            reset_result = env.reset(seed=seed + attempts)
+            observation = reset_result[0] if isinstance(reset_result, tuple) else reset_result
+            episode_rows: list[tuple[np.ndarray, str]] = []
+            episode_success = False
+            segmenter_v2 = TaskAwareSegmenter()
+            segmenter_v3 = TaskAwareV3Segmenter()
+            previous_object_position: np.ndarray | None = None
+            previous_action: np.ndarray | None = None
+            previous_info: dict[str, Any] | None = None
+            success_detected = False
+            collected_post_success_steps = 0
+            for _ in range(max_episode_steps):
+                if success_detected and post_success_steps == 0:
+                    break
+                features = extract_features(
+                    env,
+                    task_name,
+                    episode_success,
+                    previous_object_position=previous_object_position,
+                    action=previous_action,
+                    info=previous_info,
+                )
+                if segment_scheme == "heuristic_v1":
+                    label = segment_label(features)
+                elif segment_scheme == "task_aware_v2":
+                    label = segmenter_v2.label(features)
+                elif segment_scheme == "task_aware_v3":
+                    label = segmenter_v3.label(features).general
+                else:
+                    raise ValueError(f"Unsupported semantic segment scheme: {segment_scheme}")
+                episode_rows.append(
+                    (
+                        np.asarray(observation, dtype=np.float32).copy(),
+                        label,
+                    )
+                )
+                if success_detected:
+                    collected_post_success_steps += 1
+                    if collected_post_success_steps >= post_success_steps:
+                        break
+                previous_object_position = np.asarray(
+                    env.unwrapped._get_pos_objects(), dtype=np.float64
+                ).reshape(-1)[:3].copy()
+                previous_action = agent.select_action(observation, deterministic=True)
+                step_result = env.step(previous_action)
+                if len(step_result) == 5:
+                    observation, _, terminated, truncated, info = step_result
+                    done = bool(terminated or truncated)
+                else:
+                    observation, _, done, info = step_result
+                previous_info = info
+                episode_success = episode_success or bool(info.get("success", 0.0))
+                success_detected = success_detected or bool(info.get("success", 0.0))
+                if done:
+                    break
+            attempts += 1
+            if not episode_success:
+                continue
+            successful_episodes += 1
+            for observation_row, label in episode_rows:
+                segment_observations[label].append(observation_row)
+    finally:
+        env.close()
+
+    payloads: dict[str, dict[str, np.ndarray]] = {}
+    for segment in SEGMENT_ORDER:
+        observations_list = segment_observations[segment]
+        if observations_list:
+            observations = np.stack(observations_list).astype(np.float32)
+            target_means, target_log_stds = agent.compute_reference_targets(observations)
+            payloads[segment] = {
+                "observations": observations,
+                "target_means": target_means.detach().cpu().numpy().astype(np.float32),
+                "target_log_stds": target_log_stds.detach().cpu().numpy().astype(np.float32),
+            }
+        else:
+            payloads[segment] = {
+                "observations": np.empty((0, agent.observation_dim), dtype=np.float32),
+                "target_means": np.empty((0, agent.action_dim), dtype=np.float32),
+                "target_log_stds": np.empty((0, agent.action_dim), dtype=np.float32),
+            }
+    return payloads, successful_episodes
+
+
 def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
+    seed_global_rngs(args.seed)
     tasks = get_cw10_tasks(args.env_version)[: args.sequence_task_count]
     started_at = time.time()
     method = get_method(args.method)
@@ -298,6 +882,8 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         max_episode_steps=args.max_episode_steps,
         append_task_id=append_task_id,
         env_version=args.env_version,
+        reward_function_version=args.reward_function_version,
+        num_task_ids=len(tasks),
     )
     observation_dim = first_env.observation_space.shape[0]
     action_dim = first_env.action_space.shape[0]
@@ -309,6 +895,8 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         max_episode_steps=args.max_episode_steps,
         append_task_id=append_task_id,
         env_version=args.env_version,
+        reward_function_version=args.reward_function_version,
+        num_task_ids=len(tasks),
     )
     agent = method.build_agent(
         args=args,
@@ -338,10 +926,43 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
     global_step = 0
     cumulative_gradient_updates = 0
     evaluation_index = 0
+    segment_selection_manifest = (
+        load_segment_selection_manifest(args.segment_selection_manifest)
+        if args.segment_selection_manifest
+        else None
+    )
+    task_specific_segment_manifest = (
+        load_segment_selection_manifest(args.task_specific_segment_manifest)
+        if args.task_specific_segment_manifest
+        else None
+    )
     last_update_metrics: dict[str, float] | None = None
     baseline_curves = load_baseline_curves(args.baseline_curves)
+    validate_baseline_curves_for_run(
+        baseline_curves,
+        task_count=len(tasks),
+        steps_per_task=args.steps_per_task,
+        eval_every=args.eval_every,
+    )
+    stage_aware_memory_store: dict[str, list[dict[str, np.ndarray]]] = {
+        segment: [] for segment in SEGMENT_ORDER
+    }
+    static_semantic_memory_store: dict[str, list[dict[str, np.ndarray]]] = {
+        segment: [] for segment in SEGMENT_ORDER
+    }
+    llm_online_memory_store: dict[str, list[dict[str, np.ndarray]]] = {
+        segment: [] for segment in SEGMENT_ORDER
+    }
+    llm_api_key = None
+    if args.segment_selection_mode == "llm_online":
+        llm_api_key = read_api_key(args.llm_controller_api_key_env)
 
     for task_index, task_name in enumerate(tasks):
+        segment_selection: SegmentSelection | None = None
+        task_specific_selection: SegmentSelection | None = None
+        active_reference_states = 0
+        active_background_reference_states = 0
+        active_task_specific_reference_states = 0
         effective_exploration_strategy = normalize_exploration_strategy(
             args.exploration_strategy
         )
@@ -360,6 +981,106 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 source_task_index=task_index - 1,
                 target_task_index=task_index,
             )
+        if args.method == "stage_aware_semantic_bc":
+            if not isinstance(agent, FullBehaviorCloningSACAgent):
+                raise RuntimeError("stage_aware_semantic_bc requires FullBehaviorCloningSACAgent.")
+            initial_segments = stage_aware_segment_groups(0.0)
+            observations, target_means, target_log_stds = combine_reference_payloads(
+                [
+                    payload
+                    for segment in initial_segments
+                    for payload in stage_aware_memory_store[segment]
+                ]
+            )
+            if observations.shape[0] > 0:
+                agent.set_reference_memory_with_targets(
+                    observations=observations,
+                    target_means=target_means,
+                    target_log_stds=target_log_stds,
+                )
+            else:
+                agent.clear_reference_memory()
+        elif args.method in STATIC_SEMANTIC_METHODS and args.segment_selection_mode != "llm_online":
+            if not isinstance(agent, FullBehaviorCloningSACAgent):
+                raise RuntimeError(f"{args.method} requires FullBehaviorCloningSACAgent.")
+            previous_task_name = None if task_index == 0 else tasks[task_index - 1]
+            if (
+                args.method in {"adaptive_semantic_bc", "general_task_specific_bc", "semantic_hybrid_bc"}
+                or args.segment_selection_mode == "task_adaptive"
+            ):
+                segment_selection = select_segments_for_task_pair(
+                    previous_task_name=previous_task_name,
+                    new_task_name=task_name,
+                    manifest=segment_selection_manifest,
+                    fallback_segments=args.semantic_segments,
+                )
+            else:
+                segment_selection = SegmentSelection(
+                    selected_segments=tuple(args.semantic_segments),
+                    priority=tuple(args.semantic_segments),
+                    reason="Fixed semantic segment selection from CLI/config.",
+                    selection_source="fixed",
+                )
+            if args.method in {"general_task_specific_bc", "semantic_hybrid_bc"}:
+                task_specific_selection = select_task_specific_segments_for_task(
+                    task_name=task_name,
+                    manifest=task_specific_segment_manifest,
+                )
+            (
+                observations,
+                target_means,
+                target_log_stds,
+                active_background_reference_states,
+                active_task_specific_reference_states,
+            ) = build_hybrid_memory_from_store(
+                payload_store=static_semantic_memory_store,
+                selected_segments=segment_selection.selected_segments,
+                priority=segment_selection.priority,
+                background_ratio=args.background_segment_ratio,
+                task_specific_segments=(
+                    ()
+                    if task_specific_selection is None
+                    else task_specific_selection.selected_segments
+                ),
+                task_specific_ratio=args.task_specific_segment_ratio,
+            )
+            active_reference_states = int(observations.shape[0])
+            if active_reference_states > 0:
+                agent.set_reference_memory_with_targets(
+                    observations=observations,
+                    target_means=target_means,
+                    target_log_stds=target_log_stds,
+                )
+            else:
+                agent.clear_reference_memory()
+        elif (
+            args.segment_selection_mode == "llm_online"
+            and task_index > 0
+            and isinstance(agent, FullBehaviorCloningSACAgent)
+        ):
+            initial_selected_segments = tuple(args.semantic_segments)
+            initial_task_specific = select_task_specific_segments_for_task(
+                task_name=task_name,
+                manifest=task_specific_segment_manifest,
+            )
+            observations, target_means, target_log_stds, _, _ = build_hybrid_memory_from_store(
+                payload_store=llm_online_memory_store,
+                selected_segments=initial_selected_segments,
+                priority=initial_selected_segments,
+                background_ratio=args.background_segment_ratio,
+                task_specific_segments=(
+                    () if initial_task_specific is None else initial_task_specific.selected_segments
+                ),
+                task_specific_ratio=args.task_specific_segment_ratio,
+            )
+            if observations.shape[0] > 0:
+                agent.set_reference_memory_with_targets(
+                    observations=observations,
+                    target_means=target_means,
+                    target_log_stds=target_log_stds,
+                )
+            else:
+                agent.clear_reference_memory()
 
         exploration_strategy, exploration_available_heads = method.exploration_config(
             task_index=task_index,
@@ -372,6 +1093,8 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             max_episode_steps=args.max_episode_steps,
             append_task_id=append_task_id,
             env_version=args.env_version,
+            reward_function_version=args.reward_function_version,
+            num_task_ids=len(tasks),
         )
         selected_guide: int | None = None
         selected_guide_return: float | None = None
@@ -473,21 +1196,58 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 max_episode_steps=args.max_episode_steps,
                 append_task_id=append_task_id,
                 env_version=args.env_version,
+                reward_function_version=args.reward_function_version,
+                num_task_ids=len(tasks),
             )
             if guide_head_index is not None
             else None
         )
 
         task_curve_success: list[float] = []
+        task_curve_returns: list[float] = []
         gradient_updates_before_task = cumulative_gradient_updates
+        current_stage_segments = (
+            stage_aware_segment_groups(0.0)
+            if args.method == "stage_aware_semantic_bc"
+            else tuple()
+        )
+        current_llm_segments = (
+            tuple(args.semantic_segments)
+            if args.segment_selection_mode == "llm_online"
+            else tuple()
+        )
+        current_llm_priority = current_llm_segments
 
         def evaluate(task_step: int, gradient_updates: int, update_metrics: dict[str, float] | None) -> None:
             nonlocal global_step, evaluation_index, last_update_metrics
             nonlocal curriculum_stage, curriculum_reference
             nonlocal curriculum_stage_best, curriculum_stage_evaluations
+            nonlocal current_stage_segments, current_llm_segments, current_llm_priority
             evaluation_index += 1
             last_update_metrics = update_metrics
             global_step = task_index * args.steps_per_task + task_step
+            if args.method == "stage_aware_semantic_bc":
+                progress_ratio = float(task_step) / float(args.steps_per_task)
+                next_stage_segments = stage_aware_segment_groups(progress_ratio)
+                if next_stage_segments != current_stage_segments:
+                    if not isinstance(agent, FullBehaviorCloningSACAgent):
+                        raise RuntimeError("stage_aware_semantic_bc requires FullBehaviorCloningSACAgent.")
+                    observations, target_means, target_log_stds = combine_reference_payloads(
+                        [
+                            payload
+                            for segment in next_stage_segments
+                            for payload in stage_aware_memory_store[segment]
+                        ]
+                    )
+                    if observations.shape[0] > 0:
+                        agent.set_reference_memory_with_targets(
+                            observations=observations,
+                            target_means=target_means,
+                            target_log_stds=target_log_stds,
+                        )
+                    else:
+                        agent.clear_reference_memory()
+                    current_stage_segments = next_stage_segments
             rows = evaluate_all_tasks(
                 agent=agent,
                 tasks=tasks,
@@ -504,16 +1264,153 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 started_at=started_at,
                 update_metrics=update_metrics,
                 append_task_id=append_task_id,
+                reward_function_version=args.reward_function_version,
+                num_task_ids=len(tasks),
                 evaluation_task_indices=[task_index],
             )
             all_eval_rows.extend(rows)
             active_row = rows[0]
             task_curve_success.append(float(active_row["stochastic_success_rate"]))
+            task_curve_returns.append(float(active_row["stochastic_average_return"]))
             print(
                 f"[cw10] task={task_name} step={task_step:,}/{args.steps_per_task:,} "
                 f"success={active_row['stochastic_success_rate']:.3f} "
                 f"return={active_row['stochastic_average_return']:.3f}"
             )
+            if (
+                args.segment_selection_mode == "llm_online"
+                and task_index > 0
+                and isinstance(agent, FullBehaviorCloningSACAgent)
+                and llm_api_key is not None
+                and len(task_curve_success) % args.llm_controller_update_every_evals == 0
+            ):
+                available_counts = segment_payload_counts(llm_online_memory_store)
+                prompt = build_llm_gate_prompt(
+                    previous_task_name=tasks[task_index - 1],
+                    current_task_name=task_name,
+                    evaluation_index_within_task=len(task_curve_success),
+                    task_step=task_step,
+                    task_total_steps=args.steps_per_task,
+                    recent_success_curve=task_curve_success[-5:],
+                    recent_return_curve=task_curve_returns[-5:],
+                    available_segment_counts=available_counts,
+                )
+                controller_log = {
+                    "task_index": task_index,
+                    "task_name": task_name,
+                    "task_step": task_step,
+                    "evaluation_index_within_task": len(task_curve_success),
+                    "available_segment_counts": available_counts,
+                    "model": args.llm_controller_model,
+                }
+                try:
+                    controller_payload, raw_response_text = call_openai_json_controller(
+                        api_key=llm_api_key,
+                        model=args.llm_controller_model,
+                        prompt=prompt,
+                        max_output_tokens=args.llm_controller_max_output_tokens,
+                    )
+                    selected_value = controller_payload.get("selected_segments")
+                    if not isinstance(selected_value, list) or not selected_value:
+                        raise ValueError("Controller must select at least one segment.")
+                    if not all(isinstance(segment, str) for segment in selected_value):
+                        raise ValueError("Controller segment names must be strings.")
+                    selected_segments = tuple(selected_value)
+                    priority_value = controller_payload.get("priority", list(selected_segments))
+                    if not isinstance(priority_value, list) or not all(
+                        isinstance(segment, str) for segment in priority_value
+                    ):
+                        raise ValueError("Controller priority must be a list of segment names.")
+                    priority = tuple(priority_value)
+                    invalid_selected = sorted(set(selected_segments).difference(SEGMENT_ORDER))
+                    invalid_priority = sorted(set(priority).difference(selected_segments))
+                    empty_selected = sorted(
+                        segment
+                        for segment in selected_segments
+                        if available_counts.get(segment, 0) <= 0
+                    )
+                    if invalid_selected:
+                        raise ValueError(
+                            "Controller returned unsupported segments: "
+                            + ", ".join(invalid_selected)
+                        )
+                    if invalid_priority:
+                        raise ValueError(
+                            "Controller priority is outside its selected set: "
+                            + ", ".join(invalid_priority)
+                        )
+                    if empty_selected:
+                        raise ValueError(
+                            "Controller selected empty memory segments: "
+                            + ", ".join(empty_selected)
+                        )
+                    current_task_specific = select_task_specific_segments_for_task(
+                        task_name=task_name,
+                        manifest=task_specific_segment_manifest,
+                    )
+                    (
+                        observations,
+                        target_means,
+                        target_log_stds,
+                        applied_background_states,
+                        applied_task_specific_states,
+                    ) = build_hybrid_memory_from_store(
+                        payload_store=llm_online_memory_store,
+                        selected_segments=selected_segments,
+                        priority=priority,
+                        background_ratio=args.background_segment_ratio,
+                        task_specific_segments=(
+                            ()
+                            if current_task_specific is None
+                            else current_task_specific.selected_segments
+                        ),
+                        task_specific_ratio=args.task_specific_segment_ratio,
+                    )
+                    if observations.shape[0] <= 0:
+                        raise ValueError("Controller selection produced no reference states.")
+                    agent.set_reference_memory_with_targets(
+                        observations=observations,
+                        target_means=target_means,
+                        target_log_stds=target_log_stds,
+                    )
+                    current_llm_segments = selected_segments
+                    current_llm_priority = priority
+                    controller_log.update(
+                        {
+                            "status": "applied",
+                            "selected_segments": list(selected_segments),
+                            "priority": list(priority),
+                            "background_reference_states": applied_background_states,
+                            "task_specific_reference_states": applied_task_specific_states,
+                            "reason": str(controller_payload.get("reason", "")),
+                            "raw_response_text": raw_response_text,
+                        }
+                    )
+                except Exception as error:
+                    controller_log.update(
+                        {
+                            "status": "fallback_keep_previous",
+                            "selected_segments": list(current_llm_segments),
+                            "priority": list(current_llm_segments),
+                            "reason": "controller_error",
+                            "error": f"{type(error).__name__}: {error}",
+                            "raw_response_text": "",
+                        }
+                    )
+                    print(
+                        "[llm-controller] warning: keeping previous segments "
+                        f"{list(current_llm_segments)} after {type(error).__name__}: {error}"
+                    )
+                try:
+                    append_controller_log(
+                        run_dir / "controller_decisions.json",
+                        controller_log,
+                    )
+                except Exception as error:
+                    print(
+                        "[llm-controller] warning: decision log could not be written: "
+                        f"{type(error).__name__}: {error}"
+                    )
             if (
                 guide_head_index is not None
                 and task_step % args.jsrl_evaluation_interval == 0
@@ -583,6 +1480,174 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             replay_buffer=replay_buffer,
             batch_size=args.batch_size,
         )
+        reference_success_episodes = None
+        reference_states = None
+        background_reference_states = None
+        task_specific_reference_states = None
+        collected_segment_states = None
+        if args.method in {
+            "full_bc",
+            "semantic_local_bc",
+            "adaptive_semantic_bc",
+            "general_task_specific_bc",
+            "semantic_hybrid_bc",
+            "stage_aware_semantic_bc",
+        }:
+            if args.method == "full_bc":
+                reference_observations, reference_success_episodes = collect_successful_reference_observations(
+                    agent=agent,
+                    task_name=task_name,
+                    env_version=args.env_version,
+                    reward_function_version=args.reward_function_version,
+                    append_task_id=append_task_id,
+                    max_episode_steps=args.max_episode_steps,
+                    episodes=args.full_bc_reference_episodes,
+                    max_attempts=args.full_bc_reference_max_attempts,
+                    seed=args.seed + 40_000 + task_index * 1_000,
+                    num_task_ids=len(tasks),
+                )
+                background_reference_states = 0
+                task_specific_reference_states = 0
+            elif args.method == "stage_aware_semantic_bc":
+                if not isinstance(agent, FullBehaviorCloningSACAgent):
+                    raise RuntimeError("stage_aware_semantic_bc requires FullBehaviorCloningSACAgent.")
+                per_segment_payloads, reference_success_episodes = collect_reference_payloads_by_segment(
+                    agent=agent,
+                    task_name=task_name,
+                    env_version=args.env_version,
+                    reward_function_version=args.reward_function_version,
+                    append_task_id=append_task_id,
+                    max_episode_steps=args.max_episode_steps,
+                    episodes=args.full_bc_reference_episodes,
+                    max_attempts=args.full_bc_reference_max_attempts,
+                    seed=args.seed + 40_000 + task_index * 1_000,
+                    segment_scheme=args.semantic_segment_scheme,
+                    post_success_steps=args.semantic_post_success_steps,
+                    num_task_ids=len(tasks),
+                )
+                for segment, payload in per_segment_payloads.items():
+                    if payload["observations"].shape[0] > 0:
+                        stage_aware_memory_store[segment].append(payload)
+                collected_segment_states = {
+                    segment: int(payload["observations"].shape[0])
+                    for segment, payload in per_segment_payloads.items()
+                }
+                current_stage_segments = stage_aware_segment_groups(1.0)
+                reference_observations, target_means, target_log_stds = combine_reference_payloads(
+                    [
+                        payload
+                        for segment in current_stage_segments
+                        for payload in stage_aware_memory_store[segment]
+                    ]
+                )
+                reference_states = int(reference_observations.shape[0])
+                if reference_observations.shape[0] > 0:
+                    agent.set_reference_memory_with_targets(
+                        observations=reference_observations,
+                        target_means=target_means,
+                        target_log_stds=target_log_stds,
+                    )
+                else:
+                    agent.clear_reference_memory()
+                background_reference_states = 0
+                task_specific_reference_states = 0
+            elif args.segment_selection_mode == "llm_online":
+                if not isinstance(agent, FullBehaviorCloningSACAgent):
+                    raise RuntimeError("llm_online segment selection requires FullBehaviorCloningSACAgent.")
+                per_segment_payloads, reference_success_episodes = collect_reference_payloads_by_segment(
+                    agent=agent,
+                    task_name=task_name,
+                    env_version=args.env_version,
+                    reward_function_version=args.reward_function_version,
+                    append_task_id=append_task_id,
+                    max_episode_steps=args.max_episode_steps,
+                    episodes=args.full_bc_reference_episodes,
+                    max_attempts=args.full_bc_reference_max_attempts,
+                    seed=args.seed + 40_000 + task_index * 1_000,
+                    segment_scheme=args.semantic_segment_scheme,
+                    post_success_steps=args.semantic_post_success_steps,
+                    num_task_ids=len(tasks),
+                )
+                for segment, payload in per_segment_payloads.items():
+                    if payload["observations"].shape[0] > 0:
+                        llm_online_memory_store[segment].append(payload)
+                collected_segment_states = {
+                    segment: int(payload["observations"].shape[0])
+                    for segment, payload in per_segment_payloads.items()
+                }
+                current_segments = current_llm_segments
+                current_task_specific = select_task_specific_segments_for_task(
+                    task_name=task_name,
+                    manifest=task_specific_segment_manifest,
+                )
+                (
+                    reference_observations,
+                    target_means,
+                    target_log_stds,
+                    background_reference_states,
+                    task_specific_reference_states,
+                ) = build_hybrid_memory_from_store(
+                    payload_store=llm_online_memory_store,
+                    selected_segments=current_segments,
+                    priority=current_llm_priority,
+                    background_ratio=args.background_segment_ratio,
+                    task_specific_segments=(
+                        ()
+                        if current_task_specific is None
+                        else current_task_specific.selected_segments
+                    ),
+                    task_specific_ratio=args.task_specific_segment_ratio,
+                )
+                reference_states = int(reference_observations.shape[0])
+                if reference_observations.shape[0] > 0:
+                    agent.set_reference_memory_with_targets(
+                        observations=reference_observations,
+                        target_means=target_means,
+                        target_log_stds=target_log_stds,
+                    )
+                else:
+                    agent.clear_reference_memory()
+                segment_selection = SegmentSelection(
+                    selected_segments=current_segments,
+                    priority=current_llm_priority,
+                    reason="Final LLM-online selection used for accumulated memory.",
+                    selection_source="llm_online",
+                )
+            else:
+                if args.method not in STATIC_SEMANTIC_METHODS:
+                    raise RuntimeError(f"Unsupported semantic method: {args.method}")
+                if not isinstance(agent, FullBehaviorCloningSACAgent):
+                    raise RuntimeError(f"{args.method} requires FullBehaviorCloningSACAgent.")
+                per_segment_payloads, reference_success_episodes = collect_reference_payloads_by_segment(
+                    agent=agent,
+                    task_name=task_name,
+                    env_version=args.env_version,
+                    reward_function_version=args.reward_function_version,
+                    append_task_id=append_task_id,
+                    max_episode_steps=args.max_episode_steps,
+                    episodes=args.full_bc_reference_episodes,
+                    max_attempts=args.full_bc_reference_max_attempts,
+                    seed=args.seed + 40_000 + task_index * 1_000,
+                    segment_scheme=args.semantic_segment_scheme,
+                    post_success_steps=args.semantic_post_success_steps,
+                    num_task_ids=len(tasks),
+                )
+                for segment, payload in per_segment_payloads.items():
+                    if payload["observations"].shape[0] > 0:
+                        static_semantic_memory_store[segment].append(payload)
+                collected_segment_states = {
+                    segment: int(payload["observations"].shape[0])
+                    for segment, payload in per_segment_payloads.items()
+                }
+                reference_states = active_reference_states
+                background_reference_states = active_background_reference_states
+                task_specific_reference_states = active_task_specific_reference_states
+            if args.method == "full_bc":
+                reference_states = int(reference_observations.shape[0])
+                agent.add_reference_memory(observations=reference_observations)
+        else:
+            segment_selection = None
+            task_specific_selection = None
         active_task_success_curves.append(task_curve_success)
         save_sac_checkpoint(
             agent=agent,
@@ -616,6 +1681,43 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 "elapsed_seconds": time.time() - started_at,
                 "final_guide_steps": trainer.guide_steps,
                 "curriculum_transitions": json.dumps(curriculum_transitions),
+                "reference_success_episodes": reference_success_episodes,
+                "reference_states": reference_states,
+                "background_reference_states": background_reference_states,
+                "task_specific_reference_states": task_specific_reference_states,
+                "semantic_segment_scheme": (
+                    args.semantic_segment_scheme
+                    if args.method in {
+                        "semantic_local_bc",
+                        "adaptive_semantic_bc",
+                        "general_task_specific_bc",
+                        "semantic_hybrid_bc",
+                        "stage_aware_semantic_bc",
+                    }
+                    else None
+                ),
+                "collected_segment_states": collected_segment_states,
+                "selected_segments": (
+                    None
+                    if segment_selection is None
+                    else json.dumps(list(segment_selection.selected_segments))
+                ),
+                "task_specific_segments": (
+                    None
+                    if task_specific_selection is None
+                    else json.dumps(list(task_specific_selection.selected_segments))
+                ),
+                "segment_priority": (
+                    None
+                    if segment_selection is None
+                    else json.dumps(list(segment_selection.priority))
+                ),
+                "segment_selection_reason": (
+                    None if segment_selection is None else segment_selection.reason
+                ),
+                "segment_selection_source": (
+                    None if segment_selection is None else segment_selection.selection_source
+                ),
             }
         )
         env.close()
@@ -640,6 +1742,8 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             started_at=started_at,
             update_metrics=last_update_metrics,
             append_task_id=append_task_id,
+            reward_function_version=args.reward_function_version,
+            num_task_ids=len(tasks),
         )
         all_eval_rows.extend(final_rows)
 

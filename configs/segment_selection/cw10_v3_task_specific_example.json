@@ -1,0 +1,40 @@
+{
+  "tasks": {
+    "stick-pull-v3": {
+      "selected_segments": [
+        "finish_or_stabilize"
+      ],
+      "priority": [
+        "finish_or_stabilize"
+      ],
+      "reason": "Protect the late-stage insertion and pull behavior."
+    },
+    "shelf-place-v3": {
+      "selected_segments": [
+        "finish_or_stabilize"
+      ],
+      "priority": [
+        "finish_or_stabilize"
+      ],
+      "reason": "Preserve final placement and stabilization behavior."
+    },
+    "window-close-v3": {
+      "selected_segments": [
+        "finish_or_stabilize"
+      ],
+      "priority": [
+        "finish_or_stabilize"
+      ],
+      "reason": "Keep the final closing behavior anchored through later tasks."
+    },
+    "handle-press-side-v3": {
+      "selected_segments": [
+        "finish_or_stabilize"
+      ],
+      "priority": [
+        "finish_or_stabilize"
+      ],
+      "reason": "Protect the press completion behavior."
+    }
+  }
+}

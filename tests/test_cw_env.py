@@ -51,6 +51,37 @@ class TestCWEnvironment(unittest.TestCase):
             base_env.close()
             task_env.close()
 
+    def test_task_id_dimension_can_match_a_cw5_prefix(self) -> None:
+        env = make_cw_env(
+            "stick-pull-v3",
+            seed=0,
+            append_task_id=True,
+            num_task_ids=5,
+        )
+        try:
+            observation, _ = env.reset(seed=0)
+            self.assertEqual(observation[-5:].tolist(), [0.0, 0.0, 0.0, 0.0, 1.0])
+        finally:
+            env.close()
+
+    def test_stick_pull_v1_compatible_reward_env(self) -> None:
+        env = make_cw_env("stick-pull-v3", seed=0, reward_function_version="v1_compatible")
+        try:
+            observation, info = env.reset(seed=0)
+            self.assertEqual(observation.shape, env.observation_space.shape)
+            self.assertIsInstance(info, dict)
+
+            next_observation, reward, terminated, truncated, step_info = env.step(
+                env.action_space.sample()
+            )
+            self.assertEqual(next_observation.shape, env.observation_space.shape)
+            self.assertTrue(np.isfinite(float(reward)))
+            self.assertIsInstance(terminated, bool)
+            self.assertIsInstance(truncated, bool)
+            self.assertIsInstance(step_info, dict)
+        finally:
+            env.close()
+
     def test_known_task_names(self) -> None:
         self.assertEqual(len(CW10_TASKS), 10)
 

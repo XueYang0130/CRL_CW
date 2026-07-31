@@ -456,6 +456,9 @@ def compute_area_forward_transfer(
         )
 
         if denominator <= _DENOMINATOR_TOLERANCE:
+            if continual_curve.size < 2 and abs(numerator) <= _DENOMINATOR_TOLERANCE:
+                area_transfer.append(0.0)
+                continue
             raise ValueError(
                 "Area forward transfer is undefined when the "
                 "single-task baseline headroom area is zero."

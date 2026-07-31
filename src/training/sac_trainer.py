@@ -27,6 +27,12 @@ from agents import ReplayBuffer, SACAgent
 from envs import extract_success
 
 
+def seed_global_rngs(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+
 class ExplorationHeadSelector:
     """Reference-style exploration helper for multi-head continual SAC."""
 
@@ -356,12 +362,16 @@ class SACTrainer:
         agent: SACAgent,
         replay_buffer: ReplayBuffer,
         config: SACTrainerConfig,
+        reference_replay_buffer: ReplayBuffer | None = None,
+        reference_batch_size: int = 0,
     ) -> None:
         """Initialize the trainer."""
         self.env = env
         self.agent = agent
         self.replay_buffer = replay_buffer
         self.config = config
+        self.reference_replay_buffer = reference_replay_buffer
+        self.reference_batch_size = int(reference_batch_size)
         self._exploration_selector: ExplorationHeadSelector | None = None
         if self.config.exploration_strategy is not None:
             available_heads = self.config.exploration_available_heads
@@ -376,6 +386,7 @@ class SACTrainer:
 
         self._validate_environment_dimensions()
         self._validate_exploration_head()
+        self._validate_reference_replay()
         self._set_random_seeds()
         self._guide_steps = self.config.guide_steps
 
@@ -531,7 +542,7 @@ class SACTrainer:
 
             if self._should_update(environment_step):
                 for update_index in range(self.config.update_every):
-                    batch = self._sample_replay_batch()
+                    batch = self._sample_training_batch()
                     collect_metrics = bool(
                         update_index
                         == self.config.update_every - 1
@@ -748,6 +759,53 @@ class SACTrainer:
                 replay_batch.terminated
             ),
         }
+
+    def _sample_training_batch(self) -> dict[str, torch.Tensor]:
+        batch = self._sample_replay_batch()
+        if (
+            self.reference_replay_buffer is None
+            or self.reference_batch_size <= 0
+            or len(self.reference_replay_buffer) == 0
+        ):
+            return batch
+
+        reference_batch = self._sample_reference_replay_batch()
+        return {
+            key: torch.cat((batch[key], reference_batch[key]), dim=0)
+            for key in batch
+        }
+
+    def _sample_reference_replay_batch(self) -> dict[str, torch.Tensor]:
+        if self.reference_replay_buffer is None:
+            raise RuntimeError("reference replay buffer is not configured.")
+        replay_batch = self.reference_replay_buffer.sample(
+            batch_size=self.reference_batch_size,
+            device=self.agent.device,
+        )
+        return {
+            "observations": replay_batch.observations,
+            "actions": replay_batch.actions,
+            "rewards": replay_batch.rewards,
+            "next_observations": replay_batch.next_observations,
+            "terminated": replay_batch.terminated,
+        }
+
+    def _validate_reference_replay(self) -> None:
+        if self.reference_batch_size < 0:
+            raise ValueError("reference_batch_size must be non-negative.")
+        if self.reference_replay_buffer is None and self.reference_batch_size != 0:
+            raise ValueError(
+                "reference_batch_size must be zero when no reference replay buffer is provided."
+            )
+        if self.reference_replay_buffer is not None:
+            if self.reference_replay_buffer.observation_dim != self.agent.observation_dim:
+                raise ValueError(
+                    "reference replay buffer observation_dim must match the agent."
+                )
+            if self.reference_replay_buffer.action_dim != self.agent.action_dim:
+                raise ValueError(
+                    "reference replay buffer action_dim must match the agent."
+                )
 
     def _reset_environment(
         self,
@@ -1012,13 +1070,7 @@ class SACTrainer:
         random-number streams from restarting at task boundaries.
         """
         if self.config.reseed_global_rng:
-            np.random.seed(
-                self.config.seed
-            )
-
-            torch.manual_seed(
-                self.config.seed
-            )
+            seed_global_rngs(self.config.seed)
 
         action_space = getattr(
             self.env,
