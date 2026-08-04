@@ -30,7 +30,15 @@ class MethodSpec:
     defaults: dict[str, object] = field(default_factory=dict)
     agent_factory: AgentFactory = build_sac_agent
     reference_exploration: bool = False
+    complete_reference_memory: bool = False
+    success_replay_teacher: str | None = None
     guide_mode: str = "none"
+
+    def __post_init__(self) -> None:
+        if self.success_replay_teacher not in {None, "final", "best"}:
+            raise ValueError(
+                "success_replay_teacher must be None, 'final', or 'best'."
+            )
 
     def build_agent(
         self,

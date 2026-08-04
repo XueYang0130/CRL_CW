@@ -1,0 +1,77 @@
+{
+  "source": "https://metaworld.farama.org/benchmark/task_descriptions/",
+  "source_scope": "Official Meta-World task descriptions; v3 task identifiers are used by this project.",
+  "annotation_scope": "official_description and randomization are based on the official documentation. interaction_structure and likely_stages are project-derived controller annotations, not official Meta-World labels.",
+  "tasks": {
+    "hammer-v3": {
+      "official_description": "Hammer a screw into a wall with a hammer.",
+      "randomization": "Hammer and screw positions are randomized.",
+      "interaction_structure": "tool acquisition followed by aligned tool use",
+      "task_specific_labels": ["approach_object", "establish_hammer_contact", "grasp_or_engage_object", "transport_hammer", "align_hammer_to_nail", "move_engaged_object", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    },
+    "push-wall-v3": {
+      "official_description": "Push a puck to a goal while bypassing a wall.",
+      "randomization": "Puck and goal positions are randomized.",
+      "interaction_structure": "obstacle-aware approach followed by sustained planar pushing",
+      "task_specific_labels": ["approach_object", "align_tcp_for_push", "push_object_toward_target", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    },
+    "faucet-close-v3": {
+      "official_description": "Rotate a faucet clockwise to turn it off.",
+      "randomization": "Faucet position is randomized.",
+      "interaction_structure": "handle alignment followed by constrained rotation",
+      "task_specific_labels": ["approach_object", "engage_faucet_handle", "rotate_faucet_closed", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    },
+    "push-back-v3": {
+      "official_description": "Pull a puck to a goal.",
+      "randomization": "Puck and goal positions are randomized.",
+      "interaction_structure": "rear-side alignment followed by sustained planar object motion",
+      "task_specific_labels": ["approach_object", "align_tcp_for_push", "push_object_toward_target", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    },
+    "stick-pull-v3": {
+      "official_description": "Grasp a stick and use it to pull a box.",
+      "randomization": "Stick position is randomized.",
+      "interaction_structure": "tool grasp, lift, insertion or contact, then contact-preserving pull",
+      "task_specific_labels": ["approach_object", "establish_contact", "grasp_or_engage_object", "lift_and_transport_tool", "align_tool_to_handle", "move_engaged_object", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    },
+    "handle-press-side-v3": {
+      "official_description": "Press a handle down sideways.",
+      "randomization": "Handle position is randomized.",
+      "interaction_structure": "side alignment followed by directed pressing",
+      "task_specific_labels": ["approach_object", "align_to_side_handle", "press_handle_down", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    },
+    "push-v3": {
+      "official_description": "Push a puck to a goal.",
+      "randomization": "Puck and goal positions are randomized.",
+      "interaction_structure": "puck alignment followed by sustained planar pushing",
+      "task_specific_labels": ["approach_object", "align_tcp_for_push", "push_object_toward_target", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    },
+    "shelf-place-v3": {
+      "official_description": "Pick up a puck and place it on a shelf.",
+      "randomization": "Puck and shelf positions are randomized.",
+      "interaction_structure": "grasp, lift, transport, shelf alignment, and release",
+      "task_specific_labels": ["approach_object", "establish_contact", "grasp_or_engage_object", "lift_and_transport_object", "align_object_to_shelf", "move_engaged_object", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    },
+    "window-close-v3": {
+      "official_description": "Push and close a window.",
+      "randomization": "Window position is randomized.",
+      "interaction_structure": "handle approach followed by constrained sliding closure",
+      "task_specific_labels": ["approach_object", "engage_window_handle", "slide_window_closed", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    },
+    "peg-unplug-side-v3": {
+      "official_description": "Unplug a peg sideways.",
+      "randomization": "Peg position is randomized.",
+      "interaction_structure": "peg grasp or contact followed by constrained lateral extraction",
+      "task_specific_labels": ["approach_object", "establish_contact", "grasp_or_engage_object", "grasp_and_pull_peg", "extract_peg_from_socket", "move_engaged_object", "complete_and_stabilize"],
+      "likely_stages": ["approach", "contact_or_alignment", "manipulation", "finish_or_stabilize"]
+    }
+  }
+}

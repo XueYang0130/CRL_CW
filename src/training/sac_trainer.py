@@ -340,6 +340,8 @@ TrainingStepCallback = Callable[
     None,
 ]
 
+CompletedEpisodeCallback = Callable[[tuple[np.ndarray, ...], bool], None]
+
 
 class SACTrainer:
     """Online SAC interaction and update loop.
@@ -403,6 +405,7 @@ class SACTrainer:
         self,
         *,
         step_callback: TrainingStepCallback | None = None,
+        completed_episode_callback: CompletedEpisodeCallback | None = None,
     ) -> TrainingSummary:
         """Run one SAC training period.
 
@@ -427,6 +430,8 @@ class SACTrainer:
 
         episode_return = 0.0
         episode_length = 0
+        episode_observations: list[np.ndarray] = []
+        episode_succeeded = False
 
         episode_returns: list[float] = []
         episode_lengths: list[int] = []
@@ -444,6 +449,10 @@ class SACTrainer:
                 environment_step=environment_step,
                 episode_step=episode_length,
             )
+            if completed_episode_callback is not None:
+                episode_observations.append(
+                    np.asarray(observation, dtype=np.float32).copy()
+                )
 
             # =====================================================
             # 2. Execute the action.
@@ -469,6 +478,7 @@ class SACTrainer:
 
             episode_return += reward
             episode_length += 1
+            episode_succeeded = episode_succeeded or extract_success(info) > 0.0
 
             reached_manual_time_limit = (
                 episode_length
@@ -501,6 +511,11 @@ class SACTrainer:
             # 3. Record and reset a completed episode.
             # =====================================================
             if episode_ended:
+                if completed_episode_callback is not None:
+                    completed_episode_callback(
+                        tuple(episode_observations),
+                        episode_succeeded,
+                    )
                 episode_returns.append(
                     float(
                         episode_return
@@ -515,6 +530,8 @@ class SACTrainer:
 
                 episode_return = 0.0
                 episode_length = 0
+                episode_observations = []
+                episode_succeeded = False
 
                 # There is no reason to reset after the final requested
                 # environment interaction.
@@ -551,23 +568,14 @@ class SACTrainer:
                         )
                     )
 
-                    try:
-                        update_metrics = self.agent.update_batch(
-                            observations=batch["observations"],
-                            actions=batch["actions"],
-                            rewards=batch["rewards"],
-                            next_observations=batch["next_observations"],
-                            dones=batch["terminated"],
-                            collect_metrics=collect_metrics,
-                        )
-                    except TypeError:
-                        update_metrics = self.agent.update_batch(
-                            observations=batch["observations"],
-                            actions=batch["actions"],
-                            rewards=batch["rewards"],
-                            next_observations=batch["next_observations"],
-                            dones=batch["terminated"],
-                        )
+                    update_metrics = self.agent.update_batch(
+                        observations=batch["observations"],
+                        actions=batch["actions"],
+                        rewards=batch["rewards"],
+                        next_observations=batch["next_observations"],
+                        dones=batch["terminated"],
+                        collect_metrics=collect_metrics,
+                    )
 
                     if update_metrics is not None:
                         last_update_metrics = update_metrics

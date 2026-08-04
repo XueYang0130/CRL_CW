@@ -337,8 +337,11 @@ class FakeAgent:
         rewards: torch.Tensor,
         next_observations: torch.Tensor,
         dones: torch.Tensor,
+        *,
+        collect_metrics: bool = True,
     ) -> dict[str, float]:
         """Record one fake SAC update."""
+        del collect_metrics
         batch_size = (
             observations.shape[0]
         )

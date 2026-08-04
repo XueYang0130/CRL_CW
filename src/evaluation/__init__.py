@@ -17,6 +17,7 @@ from .evaluator import (
 from .single_task_baselines import (
     BaselineAggregationResult,
     aggregate_single_task_baselines,
+    aggregate_single_task_seed_batches,
 )
 from .summary import summarize_continual_run
 
@@ -27,6 +28,7 @@ __all__ = [
     "EvaluationResult",
     "SACEvaluator",
     "aggregate_single_task_baselines",
+    "aggregate_single_task_seed_batches",
     "compute_area_forward_transfer",
     "compute_continual_metrics",
     "compute_end_of_task_performance",

@@ -9,6 +9,7 @@ from evaluation import (
     compute_final_task_performance,
     compute_forward_transfer,
     mean_last_success,
+    summarize_continual_run,
 )
 
 
@@ -490,48 +491,57 @@ class TestContinualMetrics(unittest.TestCase):
                 ]
             )
 
-    def test_perfect_baseline_mean_is_rejected(
+    def test_perfect_baseline_mean_produces_undefined_normalized_ft(
         self,
     ) -> None:
         """Normalized FT is undefined with zero remaining headroom."""
-        with self.assertRaises(
-            ValueError
-        ):
-            compute_forward_transfer(
-                active_task_success_curves=[
-                    [
-                        1.0,
-                        1.0,
-                    ],
-                ],
-                baseline_success_curves=[
-                    [
-                        1.0,
-                        1.0,
-                    ],
-                ],
-            )
+        raw, normalized = compute_forward_transfer(
+            active_task_success_curves=[[1.0, 1.0]],
+            baseline_success_curves=[[1.0, 1.0]],
+        )
+        self.assertEqual(raw, (0.0,))
+        self.assertTrue(np.isnan(normalized[0]))
 
-    def test_zero_headroom_area_is_rejected(
+    def test_zero_headroom_area_produces_undefined_area_ft(
         self,
     ) -> None:
-        with self.assertRaises(
-            ValueError
-        ):
-            compute_area_forward_transfer(
-                active_task_success_curves=[
-                    [
-                        1.0,
-                        1.0,
-                    ],
-                ],
-                baseline_success_curves=[
-                    [
-                        1.0,
-                        1.0,
-                    ],
-                ],
-            )
+        result = compute_area_forward_transfer(
+            active_task_success_curves=[[1.0, 1.0]],
+            baseline_success_curves=[[1.0, 1.0]],
+        )
+        self.assertTrue(np.isnan(result[0]))
+
+    def test_aggregate_metrics_allow_undefined_area_ft(self) -> None:
+        result = compute_continual_metrics(
+            final_evaluation_successes=[[0.0, 0.0]],
+            active_task_success_curves=[[0.0], [0.0]],
+            baseline_success_curves=[[0.0], [0.0]],
+            tail_size=1,
+        )
+        self.assertTrue(np.isnan(result.average_area_forward_transfer))
+        self.assertTrue(all(np.isnan(result.area_forward_transfer_per_task)))
+
+    def test_summary_without_baselines_keeps_non_transfer_metrics(self) -> None:
+        summary = summarize_continual_run(
+            final_success_rows=[[0.2, 0.4]],
+            active_task_success_curves=[[0.2], [0.4]],
+            baseline_success_curves=None,
+            tail_size=1,
+        )
+        self.assertFalse(summary["forward_transfer_available"])
+        self.assertIsNone(summary["forward_transfer"])
+        self.assertIsNone(summary["area_forward_transfer"])
+        self.assertAlmostEqual(summary["average_performance"], 0.3)
+
+    def test_aggregate_forward_transfer_excludes_first_task(self) -> None:
+        result = compute_continual_metrics(
+            final_evaluation_successes=[[0.5, 0.5]],
+            active_task_success_curves=[[1.0, 1.0], [0.4, 0.6]],
+            baseline_success_curves=[[0.0, 0.0], [0.2, 0.2]],
+            tail_size=1,
+        )
+        self.assertAlmostEqual(result.average_raw_forward_transfer, 0.3)
+        self.assertAlmostEqual(result.average_forward_transfer, 0.375)
 
     def test_invalid_tail_size_is_rejected(
         self,

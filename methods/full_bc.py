@@ -14,6 +14,15 @@ def build_agent(
         **agent_kwargs,
         episodic_batch_size=args.episodic_batch_size,
         actor_cloning_coefficient=args.actor_cloning_coefficient,
+        bc_gradient_strategy=args.bc_gradient_strategy,
+        bc_max_norm_ratio=args.bc_max_norm_ratio,
+        bc_combination_strategy=args.bc_combination_strategy,
+        bc_adaptive_target_ratio=args.bc_adaptive_target_ratio,
+        bc_adaptive_conflict_ratio=args.bc_adaptive_conflict_ratio,
+        gradient_diagnostics=args.gradient_diagnostics,
+        gradient_diagnostics_interval=args.gradient_diagnostics_interval,
+        gradient_diagnostics_source_batch_size=args.gradient_diagnostics_source_batch_size,
+        gradient_diagnostics_seed=args.seed + 700_000,
     )
 
 
@@ -24,6 +33,7 @@ METHOD = MethodSpec(
     multi_head=True,
     hide_task_id=True,
     reference_exploration=True,
+    complete_reference_memory=True,
     defaults={
         "exploration_strategy": "best_return",
         "reset_buffer_on_task_change": True,
@@ -33,6 +43,29 @@ METHOD = MethodSpec(
         "gradient_clip_norm": 0.1,
         "full_bc_reference_episodes": 20,
         "full_bc_reference_max_attempts": 80,
+        "gradient_diagnostics": True,
     },
     agent_factory=build_agent,
 )
+
+
+def make_full_bc_method(
+    method_id: str,
+    *,
+    gradient_strategy: str,
+) -> MethodSpec:
+    defaults = dict(METHOD.defaults)
+    defaults["bc_gradient_strategy"] = gradient_strategy
+    return MethodSpec(
+        method_id=method_id,
+        modes=METHOD.modes,
+        append_task_id=METHOD.append_task_id,
+        multi_head=METHOD.multi_head,
+        hide_task_id=METHOD.hide_task_id,
+        transfer_alpha=METHOD.transfer_alpha,
+        reference_exploration=METHOD.reference_exploration,
+        complete_reference_memory=METHOD.complete_reference_memory,
+        guide_mode=METHOD.guide_mode,
+        defaults=defaults,
+        agent_factory=build_agent,
+    )

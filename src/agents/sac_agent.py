@@ -64,6 +64,13 @@ class SACAgent(nn.Module):
         self.gamma = float(gamma)
         self.polyak = float(polyak)
         self.hide_task_id = bool(hide_task_id)
+        if gradient_clip_norm is not None and (
+            not math.isfinite(gradient_clip_norm)
+            or gradient_clip_norm <= 0.0
+        ):
+            raise ValueError(
+                "gradient_clip_norm must be finite and positive when provided."
+            )
         self.gradient_clip_norm = gradient_clip_norm
 
         resolved_device = torch.device(device or "cpu")
@@ -483,6 +490,8 @@ class SACAgent(nn.Module):
             (self.log_alpha,),
         )
 
+        self._collecting_update_metrics = bool(collect_metrics)
+        self._current_actor_loss = actor_loss.detach()
         actor_gradients = self.adjust_actor_gradients(
             gradients=actor_gradients,
             parameters=actor_parameters,
@@ -625,15 +634,28 @@ class SACAgent(nn.Module):
         self,
         observations: torch.Tensor,
     ) -> int:
-        """Read the active task from the first row's task one-hot."""
+        """Read and validate one homogeneous task ID for a replay batch."""
         if self.num_tasks == 1 and self.task_id_dim == 0:
             return 0
 
-        task_index = int(
-            torch.argmax(
-                observations[0, -self.task_id_dim:]
-            ).item()
-        )
+        task_vectors = observations[:, -self.task_id_dim:]
+        task_indices = torch.argmax(task_vectors, dim=1)
+        expected = torch.zeros_like(task_vectors)
+        expected.scatter_(1, task_indices.unsqueeze(1), 1.0)
+        if not torch.allclose(task_vectors, expected, atol=1e-5, rtol=0.0):
+            raise ValueError(
+                "Observations do not contain valid one-hot task IDs."
+            )
+        # A task-conditioned single-head agent uses the one-hot vector as an
+        # ordinary network input and shares one entropy coefficient. The task
+        # label is therefore not a head/alpha index.
+        if self.num_tasks == 1:
+            return 0
+        if not bool(torch.all(task_indices == task_indices[0])):
+            raise ValueError(
+                "One SAC update batch must contain exactly one active task."
+            )
+        task_index = int(task_indices[0].item())
         self._validate_task_index(task_index)
         return task_index
 
@@ -649,6 +671,16 @@ class SACAgent(nn.Module):
             raise ValueError(
                 "parameters and gradients must have equal length."
             )
+
+        for gradient in gradients:
+            if gradient is None:
+                raise RuntimeError(
+                    f"A required {group_name} gradient is None."
+                )
+            if not bool(torch.isfinite(gradient).all()):
+                raise FloatingPointError(
+                    f"Non-finite {group_name} gradient detected before optimizer step."
+                )
 
         if self.gradient_clip_norm is not None:
             total_norm = torch.linalg.vector_norm(
@@ -669,10 +701,6 @@ class SACAgent(nn.Module):
             gradients,
             strict=True,
         ):
-            if gradient is None:
-                raise RuntimeError(
-                    f"A required {group_name} gradient is None."
-                )
             parameter.grad = gradient.detach()
 
         self.optimizer.step()
@@ -713,6 +741,16 @@ class SACAgent(nn.Module):
             self.device,
             dtype=torch.float32,
         )
+
+        for name, tensor in (
+            ("observations", prepared_observations),
+            ("actions", prepared_actions),
+            ("rewards", prepared_rewards),
+            ("next_observations", prepared_next_observations),
+            ("dones", prepared_dones),
+        ):
+            if not bool(torch.isfinite(tensor).all()):
+                raise ValueError(f"{name} must contain only finite values.")
 
         if torch.any(prepared_dones < 0.0) or torch.any(
             prepared_dones > 1.0

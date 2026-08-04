@@ -14,6 +14,15 @@ def build_agent(
         **agent_kwargs,
         episodic_batch_size=args.episodic_batch_size,
         actor_cloning_coefficient=args.actor_cloning_coefficient,
+        bc_gradient_strategy=args.bc_gradient_strategy,
+        bc_max_norm_ratio=args.bc_max_norm_ratio,
+        bc_combination_strategy=args.bc_combination_strategy,
+        bc_adaptive_target_ratio=args.bc_adaptive_target_ratio,
+        bc_adaptive_conflict_ratio=args.bc_adaptive_conflict_ratio,
+        gradient_diagnostics=args.gradient_diagnostics,
+        gradient_diagnostics_interval=args.gradient_diagnostics_interval,
+        gradient_diagnostics_source_batch_size=args.gradient_diagnostics_source_batch_size,
+        gradient_diagnostics_seed=args.seed + 700_000,
     )
 
 

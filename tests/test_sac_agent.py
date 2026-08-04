@@ -591,6 +591,122 @@ class TestSACAgent(unittest.TestCase):
                 ),
             )
 
+    def test_update_batch_rejects_nonfinite_inputs(self) -> None:
+        batch_size = 4
+        base = {
+            "observations": torch.randn(batch_size, OBSERVATION_DIM),
+            "actions": torch.randn(batch_size, ACTION_DIM),
+            "rewards": torch.randn(batch_size),
+            "next_observations": torch.randn(batch_size, OBSERVATION_DIM),
+            "dones": torch.zeros(batch_size),
+        }
+        for name in base:
+            with self.subTest(name=name):
+                batch = {key: value.clone() for key, value in base.items()}
+                batch[name].reshape(-1)[0] = float("nan")
+                with self.assertRaisesRegex(ValueError, "finite"):
+                    self.agent.update_batch(**batch)
+
+    def test_rejects_invalid_gradient_clip_norm(self) -> None:
+        for value in (-0.1, 0.0, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError,
+                "gradient_clip_norm",
+            ):
+                SACAgent(
+                    observation_dim=OBSERVATION_DIM,
+                    action_dim=ACTION_DIM,
+                    action_low=ACTION_LOW,
+                    action_high=ACTION_HIGH,
+                    gradient_clip_norm=value,
+                    device="cpu",
+                )
+
+    def test_optimizer_rejects_nonfinite_gradients(self) -> None:
+        parameters = tuple(self.agent.actor.parameters())
+        gradients = [torch.zeros_like(parameter) for parameter in parameters]
+        gradients[0].reshape(-1)[0] = float("nan")
+        with self.assertRaisesRegex(FloatingPointError, "Non-finite actor"):
+            self.agent._apply_gradients(
+                parameters=parameters,
+                gradients=tuple(gradients),
+                group_name="actor",
+            )
+
+    def test_multi_head_update_rejects_mixed_or_malformed_task_ids(self) -> None:
+        agent = SACAgent(
+            observation_dim=6,
+            action_dim=2,
+            action_low=np.full(2, -1.0, dtype=np.float32),
+            action_high=np.full(2, 1.0, dtype=np.float32),
+            num_tasks=2,
+            task_id_dim=2,
+            hide_task_id=True,
+            device="cpu",
+        )
+        observations = torch.randn(4, 6)
+        observations[:, -2:] = torch.tensor([1.0, 0.0])
+        mixed = observations.clone()
+        mixed[-1, -2:] = torch.tensor([0.0, 1.0])
+        malformed = observations.clone()
+        malformed[-1, -2:] = torch.tensor([0.5, 0.5])
+        common = {
+            "actions": torch.zeros(4, 2),
+            "rewards": torch.zeros(4, 1),
+            "dones": torch.zeros(4, 1),
+        }
+        for invalid in (mixed, malformed):
+            with self.subTest(task_vectors=invalid[:, -2:]), self.assertRaises(
+                ValueError
+            ):
+                agent.update_batch(
+                    observations=invalid,
+                    next_observations=invalid.clone(),
+                    **common,
+                )
+
+    def test_task_conditioned_single_head_accepts_later_task_ids(self) -> None:
+        agent = SACAgent(
+            observation_dim=8,
+            action_dim=2,
+            action_low=np.full(2, -1.0, dtype=np.float32),
+            action_high=np.full(2, 1.0, dtype=np.float32),
+            num_tasks=1,
+            task_id_dim=3,
+            device="cpu",
+        )
+        observations = torch.randn(4, 8)
+        observations[:, -3:] = torch.tensor([0.0, 0.0, 1.0])
+        metrics = agent.update_batch(
+            observations=observations,
+            actions=torch.zeros(4, 2),
+            rewards=torch.zeros(4, 1),
+            next_observations=observations.clone(),
+            dones=torch.zeros(4, 1),
+        )
+        self.assertTrue(np.isfinite(metrics["actor_loss"]))
+
+    def test_task_conditioned_single_head_rejects_malformed_task_ids(self) -> None:
+        agent = SACAgent(
+            observation_dim=8,
+            action_dim=2,
+            action_low=np.full(2, -1.0, dtype=np.float32),
+            action_high=np.full(2, 1.0, dtype=np.float32),
+            num_tasks=1,
+            task_id_dim=3,
+            device="cpu",
+        )
+        observations = torch.randn(4, 8)
+        observations[:, -3:] = torch.tensor([0.5, 0.5, 0.0])
+        with self.assertRaisesRegex(ValueError, "valid one-hot"):
+            agent.update_batch(
+                observations=observations,
+                actions=torch.zeros(4, 2),
+                rewards=torch.zeros(4, 1),
+                next_observations=observations.clone(),
+                dones=torch.zeros(4, 1),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

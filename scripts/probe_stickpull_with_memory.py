@@ -33,6 +33,13 @@ EVAL_FIELDS = [
     "stochastic_success_rate",
     "stochastic_average_episode_length",
     "alpha",
+    "actor_cloning_coefficient",
+    "bc_gradient_cosine",
+    "bc_gradient_norm_ratio",
+    "bc_applied_norm_ratio",
+    "bc_gradient_conflict",
+    "memory_stage",
+    "active_reference_states",
     "elapsed_seconds",
 ]
 
@@ -47,6 +54,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boost-segments", nargs="*", type=str, default=None)
     parser.add_argument("--boost-source-task-indices", nargs="*", type=int, default=None)
     parser.add_argument("--boost-multiplier", type=int, default=1)
+    parser.add_argument("--adaptive-full-memory-after", type=int, default=None)
+    parser.add_argument("--adaptive-success-threshold", type=float, default=0.0)
+    parser.add_argument("--bc-coefficient-before-success", type=float, default=None)
+    parser.add_argument("--bc-coefficient-after-success", type=float, default=None)
+    parser.add_argument("--bc-activation-success-threshold", type=float, default=0.2)
+    parser.add_argument("--gradient-aware-bc", action="store_true")
+    parser.add_argument("--gradient-aware-max-norm-ratio", type=float, default=1.0)
     parser.add_argument("--variant", choices=("no_memory", "full_memory", "filtered_memory"), default="filtered_memory")
     parser.add_argument("--steps", type=int, default=100_000)
     parser.add_argument("--eval-every", type=int, default=20_000)
@@ -253,6 +267,35 @@ def main() -> None:
         raise ValueError("new-task-index out of range.")
     if args.new_task_index == 0:
         raise ValueError("new-task-index must be later than at least one previous task.")
+    if args.adaptive_full_memory_after is not None:
+        if args.variant != "filtered_memory":
+            raise ValueError(
+                "--adaptive-full-memory-after requires --variant filtered_memory."
+            )
+        if not 0 < args.adaptive_full_memory_after < args.steps:
+            raise ValueError(
+                "--adaptive-full-memory-after must be between zero and --steps."
+            )
+        if args.adaptive_full_memory_after % args.eval_every != 0:
+            raise ValueError(
+                "--adaptive-full-memory-after must be divisible by --eval-every."
+            )
+    if not 0.0 <= args.adaptive_success_threshold <= 1.0:
+        raise ValueError("--adaptive-success-threshold must be in [0, 1].")
+    if not 0.0 <= args.bc_activation_success_threshold <= 1.0:
+        raise ValueError("--bc-activation-success-threshold must be in [0, 1].")
+    if args.gradient_aware_max_norm_ratio <= 0.0:
+        raise ValueError("--gradient-aware-max-norm-ratio must be positive.")
+    for field_name, value in (
+        ("bc-coefficient-before-success", args.bc_coefficient_before_success),
+        ("bc-coefficient-after-success", args.bc_coefficient_after_success),
+    ):
+        if value is not None and value < 0.0:
+            raise ValueError(f"--{field_name} must be non-negative.")
+    if args.bc_coefficient_after_success is not None and args.bc_coefficient_before_success is None:
+        raise ValueError(
+            "--bc-coefficient-after-success requires --bc-coefficient-before-success."
+        )
 
     method = get_method(str(config["method"]))
     append_task_id = bool(method.append_task_id)
@@ -265,6 +308,12 @@ def main() -> None:
         path=run_dir / "checkpoints" / f"task_{previous_task_index}.pt",
         map_location=args.device,
         load_optimizer=False,
+    )
+    if args.bc_coefficient_before_success is not None:
+        agent.actor_cloning_coefficient = float(args.bc_coefficient_before_success)
+    agent.configure_gradient_aware_bc(
+        enabled=args.gradient_aware_bc,
+        max_norm_ratio=args.gradient_aware_max_norm_ratio,
     )
     replay_buffer = ReplayBuffer(
         observation_dim=agent.observation_dim,
@@ -285,9 +334,11 @@ def main() -> None:
 
     reference_state_count = 0
     boosted_reference_state_count = 0
+    full_memory_payload: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
     if args.variant != "no_memory":
+        memory_manifest_path = Path(args.memory_manifest).expanduser().resolve()
         observations, target_means, target_log_stds, rows, reference_state_count = load_filtered_memory(
-            manifest_path=Path(args.memory_manifest).expanduser().resolve(),
+            manifest_path=memory_manifest_path,
             source_task_indices=args.source_task_indices,
             allowed_segments=None if args.variant == "full_memory" or args.segments is None else set(args.segments),
         )
@@ -305,6 +356,17 @@ def main() -> None:
             target_means=target_means,
             target_log_stds=target_log_stds,
         )
+        if args.adaptive_full_memory_after is not None:
+            full_observations, full_target_means, full_target_log_stds, _, _ = load_filtered_memory(
+                manifest_path=memory_manifest_path,
+                source_task_indices=None,
+                allowed_segments=None,
+            )
+            full_memory_payload = (
+                full_observations,
+                full_target_means,
+                full_target_log_stds,
+            )
 
     train_env = make_cw_env(
         new_task_name,
@@ -344,6 +406,13 @@ def main() -> None:
         "probe_boost_source_task_indices": args.boost_source_task_indices,
         "probe_boost_multiplier": args.boost_multiplier,
         "probe_boosted_reference_state_count": boosted_reference_state_count,
+        "probe_adaptive_full_memory_after": args.adaptive_full_memory_after,
+        "probe_adaptive_success_threshold": args.adaptive_success_threshold,
+        "probe_bc_coefficient_before_success": args.bc_coefficient_before_success,
+        "probe_bc_coefficient_after_success": args.bc_coefficient_after_success,
+        "probe_bc_activation_success_threshold": args.bc_activation_success_threshold,
+        "probe_gradient_aware_bc": args.gradient_aware_bc,
+        "probe_gradient_aware_max_norm_ratio": args.gradient_aware_max_norm_ratio,
         "probe_steps": args.steps,
         "probe_seed": args.seed,
         "probe_new_task_index": args.new_task_index,
@@ -353,6 +422,10 @@ def main() -> None:
 
     best_success = float("-inf")
     best_return = float("-inf")
+    memory_stage = "selective" if args.variant == "filtered_memory" else args.variant
+    active_reference_states = agent.reference_state_count
+    adaptive_expansion_step: int | None = None
+    bc_activation_step: int | None = None
 
     def evaluate(step: int, gradient_updates: int, update_metrics: dict[str, float] | None) -> None:
         del update_metrics
@@ -367,6 +440,46 @@ def main() -> None:
             seed=args.seed + 50_000 + step,
             append_task_id=append_task_id,
         )
+        nonlocal best_success, best_return
+        best_success = max(best_success, result["success_rate"])
+
+        nonlocal memory_stage, active_reference_states, adaptive_expansion_step
+        nonlocal bc_activation_step
+        should_expand = (
+            full_memory_payload is not None
+            and adaptive_expansion_step is None
+            and args.adaptive_full_memory_after is not None
+            and step >= args.adaptive_full_memory_after
+            and best_success <= args.adaptive_success_threshold
+        )
+        if should_expand:
+            full_observations, full_target_means, full_target_log_stds = full_memory_payload
+            agent.set_reference_memory_with_targets(
+                observations=full_observations,
+                target_means=full_target_means,
+                target_log_stds=full_target_log_stds,
+            )
+            memory_stage = "full_memory_fallback"
+            active_reference_states = agent.reference_state_count
+            adaptive_expansion_step = step
+            print(
+                "[stickpull-probe] adaptive memory expansion "
+                f"step={step:,} states={active_reference_states:,}"
+            )
+
+        should_activate_strong_bc = (
+            args.bc_coefficient_after_success is not None
+            and bc_activation_step is None
+            and best_success >= args.bc_activation_success_threshold
+        )
+        if should_activate_strong_bc:
+            agent.actor_cloning_coefficient = float(args.bc_coefficient_after_success)
+            bc_activation_step = step
+            print(
+                "[stickpull-probe] BC gate activated "
+                f"step={step:,} coefficient={agent.actor_cloning_coefficient:g}"
+            )
+
         eval_rows.append(
             {
                 "environment_step": step,
@@ -375,12 +488,17 @@ def main() -> None:
                 "stochastic_success_rate": result["success_rate"],
                 "stochastic_average_episode_length": result["average_episode_length"],
                 "alpha": agent.diagnostic_alpha_value(args.new_task_index),
+                "actor_cloning_coefficient": agent.actor_cloning_coefficient,
+                "bc_gradient_cosine": agent.last_bc_gradient_cosine,
+                "bc_gradient_norm_ratio": agent.last_bc_gradient_norm_ratio,
+                "bc_applied_norm_ratio": agent.last_bc_applied_norm_ratio,
+                "bc_gradient_conflict": int(agent.last_bc_conflict),
+                "memory_stage": memory_stage,
+                "active_reference_states": active_reference_states,
                 "elapsed_seconds": time.time() - started_at,
             }
         )
-        nonlocal best_success, best_return
-        if result["success_rate"] > best_success:
-            best_success = result["success_rate"]
+        if result["success_rate"] >= best_success:
             save_sac_checkpoint(
                 agent=agent,
                 path=output_dir / "checkpoints" / "best_success.pt",
@@ -420,6 +538,22 @@ def main() -> None:
         "boost_source_task_indices": args.boost_source_task_indices,
         "boost_multiplier": args.boost_multiplier,
         "boosted_reference_state_count": boosted_reference_state_count,
+        "adaptive_full_memory_after": args.adaptive_full_memory_after,
+        "adaptive_success_threshold": args.adaptive_success_threshold,
+        "adaptive_expansion_step": adaptive_expansion_step,
+        "bc_coefficient_before_success": args.bc_coefficient_before_success,
+        "bc_coefficient_after_success": args.bc_coefficient_after_success,
+        "bc_activation_success_threshold": args.bc_activation_success_threshold,
+        "bc_activation_step": bc_activation_step,
+        "final_actor_cloning_coefficient": agent.actor_cloning_coefficient,
+        "gradient_aware_bc": args.gradient_aware_bc,
+        "gradient_aware_max_norm_ratio": args.gradient_aware_max_norm_ratio,
+        "final_bc_gradient_cosine": agent.last_bc_gradient_cosine,
+        "final_bc_gradient_norm_ratio": agent.last_bc_gradient_norm_ratio,
+        "final_bc_applied_norm_ratio": agent.last_bc_applied_norm_ratio,
+        "final_bc_gradient_conflict": agent.last_bc_conflict,
+        "final_memory_stage": memory_stage,
+        "final_active_reference_states": active_reference_states,
         "final_success_rate": final_eval["stochastic_success_rate"],
         "final_average_return": final_eval["stochastic_average_return"],
         "best_success_rate": best_success,

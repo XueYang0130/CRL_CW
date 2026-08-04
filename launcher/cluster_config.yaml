@@ -1,0 +1,25 @@
+# Cluster configuration for CRL_CW experiments
+
+cluster:
+  host: 140.203.17.131
+  user: xue
+  remote_dir: ~/crl_cw
+  python_exec: /home/xue/anaconda3/envs/rl_agent/bin/python
+  
+  rsync_excludes:
+    - ".git"
+    - "__pycache__"
+    - "*.pyc"
+    - ".venv"
+    - "*.egg-info"
+    - "outputs/"
+    - "logs/"
+    - "wandb/"
+    - ".vscode"
+    - "invalid_results_archive/"
+  
+  slurm:
+    partition: cpu
+    time: "48:00:00"      # 48 hours for long CW10 runs
+    mem_per_cpu: 8G
+    cpus_per_task: 4

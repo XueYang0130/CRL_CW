@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -23,11 +24,14 @@ from envs import DEFAULT_EPISODE_LENGTH, get_cw10_tasks
 from evaluation import aggregate_single_task_baselines
 from methods import (
     available_method_ids,
+    bc_gradient_strategy_for_method,
     default_method_for_mode,
+    get_method,
     is_method_compatible,
     method_defaults,
 )
 from training import run_cw10_experiment, run_single_task_experiment
+from training.segment_selection import normalize_segment_weights
 from utils import write_json
 
 
@@ -100,9 +104,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodic-memory-per-task", type=int, default=0)
     parser.add_argument("--episodic-batch-size", type=int, default=0)
     parser.add_argument("--actor-cloning-coefficient", type=float, default=0.0)
+    parser.add_argument(
+        "--bc-gradient-strategy",
+        choices=("standard", "norm_balanced", "pcgrad_sac_priority"),
+        default="standard",
+    )
+    parser.add_argument("--bc-max-norm-ratio", type=float, default=1.0)
+    parser.add_argument(
+        "--bc-combination-strategy",
+        choices=("average", "additive", "adaptive_additive"),
+        default="average",
+    )
+    parser.add_argument("--bc-adaptive-target-ratio", type=float, default=0.2)
+    parser.add_argument("--bc-adaptive-conflict-ratio", type=float, default=0.05)
     parser.add_argument("--full-bc-reference-episodes", type=int, default=20)
     parser.add_argument("--full-bc-reference-max-attempts", type=int, default=80)
     parser.add_argument("--semantic-segments", nargs="+", default=None)
+    parser.add_argument(
+        "--semantic-segment-weights",
+        nargs="+",
+        default=None,
+        metavar="SEGMENT=WEIGHT",
+    )
     parser.add_argument(
         "--semantic-segment-scheme",
         choices=("heuristic_v1", "task_aware_v2", "task_aware_v3"),
@@ -122,7 +145,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--llm-controller-api-key-env", type=str, default="OPENAI_API_KEY")
     parser.add_argument("--llm-controller-update-every-evals", type=int, default=1)
     parser.add_argument("--llm-controller-max-output-tokens", type=int, default=400)
+    parser.add_argument(
+        "--llm-controller-prompt-dir",
+        type=str,
+        default="prompts/llm_controller",
+    )
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
+    parser.add_argument(
+        "--gradient-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--gradient-diagnostics-interval", type=int, default=500)
+    parser.add_argument(
+        "--gradient-diagnostics-source-batch-size",
+        type=int,
+        default=128,
+    )
     parser.add_argument("--wsrl-backbone-source", choices=("current", "best_return"), default="current")
     parser.add_argument("--wsrl-head-source", choices=("reset", "current", "best_return"), default="reset")
     parser.add_argument("--wsrl-warmup-steps", type=int, default=10_000)
@@ -171,19 +210,80 @@ def parse_args() -> argparse.Namespace:
     if args.method not in available_method_ids():
         parser.error(f"Unsupported method '{args.method}'. Available methods: {', '.join(available_method_ids())}")
     configured_keys = set(config) if args.config is not None else set()
+    supplied_keys = explicit_destinations | configured_keys
+    if args.mode == "continual" and "num_tasks" in supplied_keys:
+        parser.error(
+            "--num-tasks applies only to single-batch mode; use "
+            "--sequence-task-count for continual mode."
+        )
+    if args.mode != "continual" and "sequence_task_count" in supplied_keys:
+        parser.error(
+            "--sequence-task-count applies only to continual mode; use "
+            "--num-tasks for single-batch mode."
+        )
     for key, value in method_defaults(args.method).items():
         if key not in explicit_destinations and key not in configured_keys:
             setattr(args, key, value)
+    expected_gradient_strategy = bc_gradient_strategy_for_method(args.method)
+    if args.bc_gradient_strategy != expected_gradient_strategy:
+        parser.error(
+            f"--method {args.method} requires --bc-gradient-strategy "
+            f"{expected_gradient_strategy}."
+        )
     if not is_method_compatible(args.mode, args.method):
         parser.error(f"Method '{args.method}' is not compatible with mode '{args.mode}'.")
+    if (
+        args.mode == "continual"
+        and get_method(args.method).multi_head
+        and not args.reset_buffer_on_task_change
+    ):
+        parser.error(
+            "Multi-head methods require --reset-buffer-on-task-change because "
+            "SAC update batches must contain one task-specific alpha/head."
+        )
     if args.total_steps is None:
         args.total_steps = args.steps_per_task
     if args.semantic_segments is not None:
         args.semantic_segments = list(args.semantic_segments)
-    if args.background_segment_ratio < 0.0:
-        parser.error("--background-segment-ratio must be non-negative.")
-    if args.task_specific_segment_ratio < 0.0:
-        parser.error("--task-specific-segment-ratio must be non-negative.")
+    if args.semantic_segment_weights is not None:
+        parsed_weights: dict[str, float] = {}
+        for item in args.semantic_segment_weights:
+            if "=" not in item:
+                parser.error(
+                    "--semantic-segment-weights entries must use SEGMENT=WEIGHT."
+                )
+            segment, raw_weight = item.split("=", 1)
+            segment = segment.strip()
+            try:
+                weight = float(raw_weight)
+            except ValueError:
+                parser.error(f"Invalid semantic segment weight: {item!r}")
+            if not segment or weight <= 0.0:
+                parser.error("Semantic segment weights must be positive.")
+            parsed_weights[segment] = weight
+        selected = tuple(args.semantic_segments or parsed_weights)
+        try:
+            args.semantic_segment_weights = dict(
+                normalize_segment_weights(
+                    parsed_weights,
+                    selected_segments=selected,
+                    field_name="--semantic-segment-weights",
+                )
+            )
+        except ValueError as error:
+            parser.error(str(error))
+    if not math.isfinite(args.background_segment_ratio) or (
+        args.background_segment_ratio < 0.0
+    ):
+        parser.error(
+            "--background-segment-ratio must be finite and non-negative."
+        )
+    if not math.isfinite(args.task_specific_segment_ratio) or (
+        args.task_specific_segment_ratio < 0.0
+    ):
+        parser.error(
+            "--task-specific-segment-ratio must be finite and non-negative."
+        )
     if args.semantic_post_success_steps < 0:
         parser.error("--semantic-post-success-steps must be non-negative.")
     if args.llm_controller_update_every_evals <= 0:
@@ -194,8 +294,115 @@ def parse_args() -> argparse.Namespace:
         parser.error("--num-tasks must be between 1 and 10.")
     if args.steps_per_task <= 0 or args.total_steps <= 0:
         parser.error("Training steps must be positive.")
+    if args.replay_size <= 0 or args.batch_size <= 0:
+        parser.error("Replay size and batch size must be positive.")
+    if (
+        get_method(args.method).success_replay_teacher is not None
+        and args.episodic_memory_per_task <= 0
+    ):
+        parser.error(
+            "Successful replay methods require --episodic-memory-per-task "
+            "to be positive."
+        )
+    if args.start_steps < 0 or args.update_after < 0 or args.update_every <= 0:
+        parser.error(
+            "Start/update-after steps must be non-negative and update-every positive."
+        )
+    if args.max_episode_steps <= 0:
+        parser.error("--max-episode-steps must be positive.")
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0.0:
+        parser.error("--learning-rate must be finite and positive.")
+    if not math.isfinite(args.gamma) or not 0.0 <= args.gamma <= 1.0:
+        parser.error("--gamma must be finite and in [0, 1].")
+    if not math.isfinite(args.polyak) or not 0.0 <= args.polyak <= 1.0:
+        parser.error("--polyak must be finite and in [0, 1].")
+    if not math.isfinite(args.target_output_std) or args.target_output_std <= 0.0:
+        parser.error("--target-output-std must be finite and positive.")
+    if not math.isfinite(args.initial_log_alpha):
+        parser.error("--initial-log-alpha must be finite.")
     if args.eval_every <= 0:
         parser.error("--eval-every must be positive.")
+    if args.gradient_diagnostics_interval <= 0:
+        parser.error("--gradient-diagnostics-interval must be positive.")
+    if args.gradient_diagnostics_source_batch_size <= 0:
+        parser.error("--gradient-diagnostics-source-batch-size must be positive.")
+    if args.llm_controller_max_output_tokens <= 0:
+        parser.error("--llm-controller-max-output-tokens must be positive.")
+    if not math.isfinite(args.actor_cloning_coefficient) or (
+        args.actor_cloning_coefficient < 0.0
+    ):
+        parser.error(
+            "--actor-cloning-coefficient must be finite and non-negative."
+        )
+    if not math.isfinite(args.bc_max_norm_ratio) or args.bc_max_norm_ratio <= 0.0:
+        parser.error("--bc-max-norm-ratio must be finite and positive.")
+    if (
+        not math.isfinite(args.bc_adaptive_target_ratio)
+        or args.bc_adaptive_target_ratio < 0.0
+    ):
+        parser.error("--bc-adaptive-target-ratio must be finite and non-negative.")
+    if (
+        not math.isfinite(args.bc_adaptive_conflict_ratio)
+        or args.bc_adaptive_conflict_ratio < 0.0
+    ):
+        parser.error("--bc-adaptive-conflict-ratio must be finite and non-negative.")
+    if args.bc_adaptive_conflict_ratio > args.bc_adaptive_target_ratio:
+        parser.error(
+            "--bc-adaptive-conflict-ratio cannot exceed "
+            "--bc-adaptive-target-ratio."
+        )
+    if args.gradient_clip_norm is not None and (
+        not math.isfinite(args.gradient_clip_norm)
+        or args.gradient_clip_norm <= 0.0
+    ):
+        parser.error(
+            "--gradient-clip-norm must be finite and positive when provided."
+        )
+    if args.best_return_eval_episodes <= 0:
+        parser.error("--best-return-eval-episodes must be positive.")
+    if args.full_bc_reference_episodes <= 0:
+        parser.error("--full-bc-reference-episodes must be positive.")
+    if args.full_bc_reference_max_attempts < args.full_bc_reference_episodes:
+        parser.error(
+            "--full-bc-reference-max-attempts must be at least "
+            "--full-bc-reference-episodes."
+        )
+    if args.packnet_retrain_steps < 0:
+        parser.error("--packnet-retrain-steps must be non-negative.")
+    if args.method == "wsrl_continual" and args.wsrl_warmup_steps <= 0:
+        parser.error("--wsrl-warmup-steps must be positive.")
+    if args.method == "jsrl_continual":
+        if not 0 < args.jsrl_initial_guide_steps < args.max_episode_steps:
+            parser.error(
+                "--jsrl-initial-guide-steps must be positive and below the episode horizon."
+            )
+        if args.jsrl_curriculum_stages < 2:
+            parser.error("--jsrl-curriculum-stages must be at least 2.")
+        if args.jsrl_evaluation_interval <= 0 or (
+            args.jsrl_evaluation_interval % args.eval_every != 0
+        ):
+            parser.error(
+                "--jsrl-evaluation-interval must be positive and divisible by --eval-every."
+            )
+        if args.jsrl_moving_average_window <= 0:
+            parser.error("--jsrl-moving-average-window must be positive.")
+        if (
+            not math.isfinite(args.jsrl_stage_tolerance)
+            or not 0.0 <= args.jsrl_stage_tolerance < 1.0
+        ):
+            parser.error("--jsrl-stage-tolerance must be finite and in [0, 1).")
+        if args.jsrl_min_evaluations_per_stage <= 0:
+            parser.error("--jsrl-min-evaluations-per-stage must be positive.")
+        if (
+            args.jsrl_max_evaluations_without_advance
+            < args.jsrl_moving_average_window
+            or args.jsrl_max_evaluations_without_advance
+            < args.jsrl_min_evaluations_per_stage
+        ):
+            parser.error(
+                "--jsrl-max-evaluations-without-advance must be at least both "
+                "the moving-average window and minimum evaluations per stage."
+            )
     if args.stoch_eval_episodes <= 0:
         parser.error("--stoch-eval-episodes must be positive.")
     if args.det_eval_episodes < 0:
@@ -205,6 +412,7 @@ def parse_args() -> argparse.Namespace:
     if (
         args.task_specific_segment_ratio > 0.0
         and args.task_specific_segment_manifest is None
+        and args.segment_selection_mode != "llm_online"
     ):
         parser.error(
             "--task-specific-segment-ratio requires "
@@ -212,6 +420,27 @@ def parse_args() -> argparse.Namespace:
         )
     if args.segment_selection_mode == "llm_online" and args.mode != "continual":
         parser.error("llm_online segment selection requires --mode continual.")
+    semantic_selection_methods = {
+        "semantic_local_bc",
+        "adaptive_semantic_bc",
+        "general_task_specific_bc",
+        "semantic_hybrid_bc",
+    }
+    if (
+        args.segment_selection_mode != "fixed"
+        and args.method not in semantic_selection_methods
+    ):
+        parser.error(
+            f"--segment-selection-mode {args.segment_selection_mode} is not "
+            f"implemented for method {args.method}."
+        )
+    if (
+        args.segment_selection_manifest is not None
+        or args.task_specific_segment_manifest is not None
+    ) and args.method not in semantic_selection_methods:
+        parser.error(
+            "Semantic selection manifests require a semantic memory method."
+        )
     for option_name, path_value in (
         ("--baseline-curves", args.baseline_curves),
         ("--segment-selection-manifest", args.segment_selection_manifest),
@@ -231,6 +460,34 @@ def make_run_directory(base_output_dir: str | Path, run_name: str) -> Path:
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "checkpoints").mkdir()
     return run_dir
+
+
+def run_logged_subprocess(
+    command: list[str],
+    *,
+    log_path: Path,
+    env: dict[str, str] | None = None,
+) -> int:
+    process_env = os.environ.copy()
+    if env:
+        process_env.update(env)
+    process_env["PYTHONUNBUFFERED"] = "1"
+
+    with log_path.open("w", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=process_env,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            print(line, end="", flush=True)
+            log_file.write(line)
+            log_file.flush()
+        return process.wait()
 
 
 def run_single(args: argparse.Namespace) -> None:
@@ -338,25 +595,39 @@ def run_single_batch(args: argparse.Namespace) -> None:
         ]
         started_at = time.time()
         started_iso = datetime.now(timezone.utc).isoformat()
-        with log_path.open("w", encoding="utf-8") as log_file:
-            result = subprocess.run(command, stdout=log_file, stderr=subprocess.STDOUT)
+        print(
+            f"[single-batch] start task={task_index + 1}/{len(tasks)} "
+            f"name={task_name} seed={args.seed} log={log_path}",
+            flush=True,
+        )
+        return_code = run_logged_subprocess(
+            command,
+            log_path=log_path,
+        )
         finished_iso = datetime.now(timezone.utc).isoformat()
+        elapsed_seconds = time.time() - started_at
+        print(
+            f"[single-batch] finish task={task_index + 1}/{len(tasks)} "
+            f"name={task_name} seed={args.seed} return_code={return_code} "
+            f"elapsed_seconds={elapsed_seconds:.1f}",
+            flush=True,
+        )
         manifest_rows.append(
             {
                 "task_index": task_index,
                 "task_name": task_name,
-                "status": "completed" if result.returncode == 0 else "failed",
+                "status": "completed" if return_code == 0 else "failed",
                 "run_name": task_run_name,
                 "run_directory": str(runs_dir / task_run_name),
                 "log_path": str(log_path),
-                "return_code": result.returncode,
+                "return_code": return_code,
                 "started_at_utc": started_iso,
                 "finished_at_utc": finished_iso,
-                "elapsed_seconds": time.time() - started_at,
-                "error": "" if result.returncode == 0 else f"process exited with {result.returncode}",
+                "elapsed_seconds": elapsed_seconds,
+                "error": "" if return_code == 0 else f"process exited with {return_code}",
             }
         )
-        if result.returncode != 0:
+        if return_code != 0:
             break
 
     manifest_path = batch_dir / "batch_manifest.csv"

@@ -21,7 +21,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--task-summaries",
         type=str,
-        default="outputs/single_task_baselines/cw10_v3_v1_ft_ready/aggregate/task_summaries.csv",
+        default=(
+            "outputs/single_task_baselines/cw10_v3_v1_500k_seeds1_2/"
+            "aggregate/task_summaries.csv"
+        ),
     )
     parser.add_argument(
         "--checkpoint-metric",

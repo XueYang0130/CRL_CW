@@ -1,17 +1,25 @@
 # CRL-CW
 
-This project is a modern continual manipulation RL workspace built on:
+PyTorch continual reinforcement-learning workspace for the Continual World
+CW10 manipulation sequence on Meta-World v3.
 
-- `Meta-World v3`
-- `Gymnasium`
-- `PyTorch`
+The current project protocol is:
 
-It keeps the fixed `CW10` task order while using the current `Meta-World`
-environment stack and full observations.
+- environments: Meta-World v3 through Gymnasium;
+- observations: full native v3 observations, with no 12-dimensional legacy cut;
+- reward protocol: `cw10_v1`;
+- `stick-pull-v3`: local `v1_compatible` reward alignment for the v3
+  observation layout;
+- pilot budget: `500,000` environment steps per task;
+- evaluation: every `20,000` steps, five stochastic episodes, zero
+  deterministic episodes.
 
-## Benchmark
+`cw10_v1` maps ordinary tasks to Meta-World's v1-style reward. For
+`stick-pull-v3`, the repo uses a wrapper instead of editing installed
+Meta-World source, because the old reward indices do not match the v3
+observation layout.
 
-The benchmark task sequence is:
+## CW10 Tasks
 
 1. `hammer-v3`
 2. `push-wall-v3`
@@ -24,128 +32,106 @@ The benchmark task sequence is:
 9. `window-close-v3`
 10. `peg-unplug-side-v3`
 
-Single-task runs use the raw environment observation.
-
-Continual runs append a ten-way task one-hot vector to the observation.
-
-## Defaults
-
-The main experiment protocol follows the reference SAC continual benchmark
-hyperparameter defaults where practical:
-
-- `1,000,000` steps per task
-- `20,000` evaluation interval
-- `1,000,000` replay size
-- `128` batch size
-- `10,000` random start steps
-- `1,000` update start
-- `50` update frequency
-- `1e-3` learning rate
-- `0.99` discount
-- `0.995` Polyak averaging
-- `200` max episode length
-
-This project matches the baseline training protocol defaults, not the old
-MuJoCo 2.0 stack or the old 12-dimensional observation protocol.
-
-## Layout
+## Repository Layout
 
 ```text
-src/
-  agents/
-  envs/
-  evaluation/
-  training/
-  utils/
-
-methods/
-  fine_tuning.py
-  task_conditioned.py
-  packnet.py
-  clonex_sac.py
-
-scripts/
-  run.py
+configs/      YAML presets
+docs/         research log, walkthrough, and analysis notes
+methods/      method registry entries and method defaults
+outputs/      generated experiment artifacts
+prompts/      LLM controller prompts and task descriptions
+references/   external papers and third-party code snapshots
+scripts/      runnable training and diagnostic entry points
+src/          agents, environments, training, evaluation, and utilities
+tests/        automated tests
 ```
 
-`outputs/` stores experiment artifacts.
+`references/` is not imported by the active training pipeline. `outputs/`
+contains experiment evidence and can be large.
 
-`references/` stores external papers and third-party code snapshots.
+## Main Methods
 
-`methods/` contains the method registry entries, architecture choices,
-agent factories, and method-specific defaults. The continual runner contains
-only the shared task loop.
+- `single_task_baseline`: independent SAC for forward-transfer baselines.
+- `fine_tuning`: sequential SAC with no retention mechanism.
+- `clonex_sac`: ClonEx-style multi-head SAC with best-return exploration and
+  Gaussian KL actor cloning.
+- `full_bc`: complete successful old-task rollout memory with the same
+  Gaussian KL actor cloning loss.
+- `full_bc_norm_balanced`: Full BC with BC gradient magnitude capped relative
+  to the current SAC shared-backbone gradient.
+- `full_bc_pcgrad`: norm-balanced Full BC with asymmetric PCGrad that removes
+  only BC components conflicting with the current SAC gradient.
+- `semantic_local_bc`: static semantic memory using selected general segments.
+- `semantic_hybrid_bc`: general, background, and task-specific semantic memory,
+  with optional online LLM control of the general segment weights.
 
-## Running
+`gradient-aware BC` is an experimental diagnostic path in the stick-pull probe
+script. It is default-off and is not part of the formal baseline set.
+
+Full BC and ClonEx continual runs also collect read-only gradient-conflict
+evidence under `<run_dir>/gradient_diagnostics/`. This logging is enabled by
+their method presets, sampled sparsely, incrementally persisted, and does not
+alter training gradients. Use `--no-gradient-diagnostics` for a control.
+
+## Common Commands
 
 Run one single-task baseline:
 
 ```bash
-python scripts/run.py \
+PYTHONPATH=src .venv/bin/python scripts/run.py \
   --mode single \
   --method single_task_baseline \
   --task hammer-v3 \
-  --total-steps 1000000 \
+  --env-version v3 \
+  --reward-function-version cw10_v1 \
+  --total-steps 500000 \
   --eval-every 20000 \
+  --stoch-eval-episodes 5 \
+  --det-eval-episodes 0 \
   --device cpu
 ```
 
-Run an independent CW10 single-task baseline batch:
+Run a CW10 single-task batch for one seed:
 
 ```bash
-python scripts/run.py \
+caffeinate -dimsu env PYTHONPATH=src .venv/bin/python scripts/run.py \
   --mode single-batch \
   --method single_task_baseline \
-  --steps-per-task 1000000 \
+  --env-version v3 \
+  --reward-function-version cw10_v1 \
+  --num-tasks 10 \
+  --steps-per-task 500000 \
   --eval-every 20000 \
-  --device cpu
+  --stoch-eval-episodes 5 \
+  --det-eval-episodes 0 \
+  --seed 1 \
+  --device cpu \
+  --output-dir outputs/single_task_baselines \
+  --run-name cw10_v3_v1_500k_seed1
 ```
 
-This batch command also aggregates the completed single-task runs into:
-
-- `aggregate/baseline_curves.json`
-- `aggregate/summary.json`
-
-Run continual finetuning on CW10:
+Run a continual method:
 
 ```bash
-python scripts/run.py \
+caffeinate -dimsu env PYTHONPATH=src .venv/bin/python scripts/run.py \
   --mode continual \
-  --method fine_tuning \
-  --sequence-task-count 10 \
-  --steps-per-task 1000000 \
+  --method full_bc \
+  --env-version v3 \
+  --reward-function-version cw10_v1 \
+  --steps-per-task 500000 \
   --eval-every 20000 \
-  --device cpu
+  --stoch-eval-episodes 5 \
+  --det-eval-episodes 0 \
+  --baseline-curves outputs/single_task_baselines/cw10_v3_v1_500k_seeds1_2/aggregate/baseline_curves.json \
+  --seed 0 \
+  --device cpu \
+  --run-name full_bc_cw10_v3_v1_500k_seed0
 ```
 
-Run the final ClonEx-SAC method with its paper defaults:
-
-```bash
-python scripts/run.py \
-  --mode continual \
-  --method clonex_sac \
-  --sequence-task-count 10 \
-  --steps-per-task 1000000 \
-  --eval-every 20000 \
-  --device cpu
-```
-
-Run from a YAML config:
-
-```bash
-python scripts/run.py \
-  --config configs/w10_pilot.yaml
-```
-
-If you already have aggregated single-task baseline curves, pass them to the
-continual run so the final summary includes forward transfer:
-
-```bash
-python scripts/run.py \
-  --mode continual \
-  --method fine_tuning \
-  --baseline-curves outputs/cw10_single_task_baselines/<run>/aggregate/baseline_curves.json
-```
+Formal forward-transfer reporting should use aggregated multi-seed
+single-task curves, then compare each continual seed against the same aggregate
+baseline. Aggregate FT excludes task 0 because no previous task can transfer to
+the first task.
 
 ## Outputs
 
@@ -162,20 +148,26 @@ A continual run writes:
 - `evaluations.csv`
 - `task_summaries.csv`
 - `summary.json`
-- `checkpoints/`
+- `checkpoints/task_*.pt`
+- `controller_prompts/` and `controller_decisions.json` for LLM runs
 
-The continual `summary.json` includes:
+Main continual metrics include average performance, average forgetting, raw
+forward transfer, normalized forward transfer, area forward transfer, and
+per-task final success.
 
-- `average_performance`
-- `average_return`
-- `average_forgetting`
-- `forward_transfer`
-- per-task final success
-- per-task forgetting
+## Handover
 
-## Notes
+Read these first:
 
-- Smoke tests were validated on CPU.
-- The project disables Gymnasium's passive env checker for Meta-World env
-  creation to avoid noisy observation-space warnings from the upstream env
-  definitions.
+1. `docs/research_log.md`
+2. `docs/repo_walkthrough.md`
+3. `scripts/run.py`
+4. `methods/semantic_hybrid_bc.py`
+5. `src/training/continual_experiment.py`
+
+Run tests after changing environments, metrics, memory construction, semantic
+segmentation, or LLM control:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pytest -q
+```

@@ -1,0 +1,9 @@
+{
+  "benchmark": "CW10 task order implemented with Meta-World v3 Gymnasium environments",
+  "observation_protocol": "Use the complete native v3 observation; no truncation to the legacy 12-dimensional layout.",
+  "reward_protocol": "cw10_v1",
+  "default_reward_mapping": "Use each v3 environment's reward_function_version=v1 implementation.",
+  "stick_pull_exception": "For stick-pull-v3, use the project-local v1_compatible wrapper. It preserves the old v1 reward structure but aligns positions to the v3 observation layout: stick=obs[4:7], handle=obs[11:14], and container=handle+[0.05,0,0]. The installed Meta-World package is not modified.",
+  "episode_horizon": 200,
+  "controller_weight_semantics": "Weights are probabilities over selected general-memory semantic segments. They must be positive and sum to 1. Side-channel background and task-specific anchors are configured separately."
+}

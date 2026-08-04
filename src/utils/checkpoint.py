@@ -1,6 +1,6 @@
-"""Checkpoint utilities for SAC training.
+"""Checkpoint utilities for SAC policy snapshots.
 
-A checkpoint stores the complete trainable SAC state:
+A checkpoint stores trainable SAC parameters and optimizer state:
 
 - actor parameters;
 - online critic parameters;
@@ -10,7 +10,9 @@ A checkpoint stores the complete trainable SAC state:
 - environment-step count;
 - optional experiment metadata.
 
-The online replay buffer is intentionally not stored here.
+Online replay and method-specific memories, including Full BC episodic memory,
+are intentionally not stored. These files support evaluation and diagnostics;
+they are not sufficient for lossless continuation of a continual run.
 """
 
 from __future__ import annotations
@@ -76,7 +78,7 @@ def save_sac_checkpoint(
     environment_step: int,
     metadata: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Save a complete SAC checkpoint."""
+    """Save SAC parameters and optimizer state for evaluation or diagnostics."""
     _validate_agent_interface(agent)
 
     if environment_step < 0:

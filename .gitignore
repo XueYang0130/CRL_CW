@@ -27,3 +27,6 @@ wandb/
 .env
 .env.*
 !.env.example
+
+# Generated Slurm scripts
+scripts/slurm/*.sh

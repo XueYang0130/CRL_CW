@@ -6,13 +6,17 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from string import Template
 from typing import Any
+
+from training.segment_selection import normalize_segment_weights
 
 
 @dataclass(frozen=True)
 class LLMGateDecision:
     selected_segments: tuple[str, ...]
     priority: tuple[str, ...]
+    weights: tuple[tuple[str, float], ...]
     reason: str
     raw_response_text: str
     model: str
@@ -117,7 +121,7 @@ def call_openai_json_controller(
         (
             prompt
             + "\n\nIMPORTANT: Return exactly one minified JSON object on a single line. "
-            + 'Use at most 2 selected_segments. Keep "reason" to 2-6 words only. '
+            + 'Use at most 3 selected_segments. Keep "reason" to 2-6 words only. '
             + "No markdown. No repetition. No line breaks inside strings."
         ),
     ]
@@ -172,20 +176,39 @@ def call_openai_json_controller(
             not isinstance(selected_segments, list)
             or not selected_segments
             or not all(isinstance(segment, str) for segment in selected_segments)
+            or len(set(selected_segments)) != len(selected_segments)
         ):
             last_error = ValueError(
-                "Controller selected_segments must be a non-empty array of strings."
+                "Controller selected_segments must be a non-empty array of unique strings."
             )
             continue
-        parsed["selected_segments"] = selected_segments[:2]
+        parsed["selected_segments"] = selected_segments[:3]
         priority = parsed.get("priority")
         if not isinstance(priority, list) or not all(
             isinstance(segment, str) for segment in priority
-        ):
+        ) or len(set(priority)) != len(priority):
             last_error = ValueError("Controller priority must be an array of strings.")
             continue
         allowed = set(parsed["selected_segments"])
-        parsed["priority"] = [segment for segment in priority if segment in allowed][:2]
+        parsed["priority"] = [segment for segment in priority if segment in allowed][:3]
+        weights = parsed.get("weights")
+        if not isinstance(weights, dict):
+            last_error = ValueError("Controller weights must be an object.")
+            continue
+        try:
+            normalized_weights = dict(
+                normalize_segment_weights(
+                    weights,
+                    selected_segments=tuple(parsed["selected_segments"]),
+                    field_name="Controller weights",
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            last_error = ValueError(
+                "Controller weights must contain a positive value for each selected segment."
+            )
+            continue
+        parsed["weights"] = normalized_weights
         reason = parsed.get("reason")
         if not isinstance(reason, str) or not reason.strip():
             parsed["reason"] = "controller fallback"
@@ -210,42 +233,53 @@ def build_llm_gate_prompt(
     recent_success_curve: list[float],
     recent_return_curve: list[float],
     available_segment_counts: dict[str, int],
+    available_task_specific_counts: dict[str, int] | None = None,
+    current_selected_segments: tuple[str, ...] = (),
+    current_segment_weights: dict[str, float] | None = None,
+    prompt_dir: str | Path = "prompts/llm_controller",
 ) -> str:
-    previous_task_line = previous_task_name or "None (first task)"
-    return f"""You are an online semantic replay controller for continual reinforcement learning.
-
-Current transition:
-- previous_task: {previous_task_line}
-- current_task: {current_task_name}
-
-Current training state:
-- evaluation_index_within_task: {evaluation_index_within_task}
-- task_step: {task_step}
-- task_total_steps: {task_total_steps}
-- recent_success_curve: {json.dumps(recent_success_curve)}
-- recent_return_curve: {json.dumps(recent_return_curve)}
-
-Available replay segments and counts:
-{json.dumps(available_segment_counts, indent=2, sort_keys=True)}
-
-Your job:
-- Choose which semantic replay segments should be emphasized for the next training stage.
-- Prefer a small, high-value subset when the current task is bottlenecked.
-- If the current task still seems to need broader support, include more segments.
-
-Output JSON only with keys:
-- "selected_segments": array of segment names
-- "priority": ordered array of segment names
-- "reason": short string
-
-Constraints:
-- Every segment must be one of the available segment names.
-- "priority" must contain only segments from "selected_segments".
-- Select at most 2 segments.
-- Do not output any prose outside JSON.
-- Return exactly one minified JSON object on a single line.
-- Keep the reason to 2-6 words only.
-"""
+    asset_dir = Path(prompt_dir).expanduser().resolve()
+    template = Template((asset_dir / "online_semantic_gate.txt").read_text(encoding="utf-8"))
+    protocol = json.loads((asset_dir / "protocol.json").read_text(encoding="utf-8"))
+    descriptions = json.loads(
+        (asset_dir / "cw10_v3_task_descriptions.json").read_text(encoding="utf-8")
+    )
+    task_profiles = descriptions.get("tasks", {})
+    if current_task_name not in task_profiles:
+        raise ValueError(f"Missing LLM task description for {current_task_name}.")
+    previous_profile: dict[str, Any] | None = None
+    if previous_task_name is not None:
+        if previous_task_name not in task_profiles:
+            raise ValueError(f"Missing LLM task description for {previous_task_name}.")
+        previous_profile = {
+            "task_name": previous_task_name,
+            **task_profiles[previous_task_name],
+        }
+    current_profile = {
+        "task_name": current_task_name,
+        **task_profiles[current_task_name],
+    }
+    training_state = {
+        "evaluation_index_within_task": evaluation_index_within_task,
+        "task_step": task_step,
+        "task_total_steps": task_total_steps,
+        "recent_success_curve": recent_success_curve,
+        "recent_return_curve": recent_return_curve,
+        "current_selected_segments": list(current_selected_segments),
+        "current_segment_weights": current_segment_weights or {},
+    }
+    return template.substitute(
+        protocol=json.dumps(protocol, indent=2, sort_keys=True),
+        previous_task_profile=json.dumps(previous_profile, indent=2, sort_keys=True),
+        current_task_profile=json.dumps(current_profile, indent=2, sort_keys=True),
+        training_state=json.dumps(training_state, indent=2, sort_keys=True),
+        available_segment_counts=json.dumps(
+            available_segment_counts, indent=2, sort_keys=True
+        ),
+        available_task_specific_counts=json.dumps(
+            available_task_specific_counts or {}, indent=2, sort_keys=True
+        ),
+    )
 
 
 def read_api_key(env_var_name: str) -> str:

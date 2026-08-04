@@ -42,13 +42,14 @@ class ContinualMetricsResult:
             Negative values mean later improvement.
 
         average_forward_transfer:
-            Mean normalized forward transfer over tasks.
+            Mean normalized forward transfer over tasks 1..N-1. Task 0 is
+            excluded because no previously learned task can transfer to it.
 
         average_raw_forward_transfer:
-            Mean unnormalized forward transfer over tasks.
+            Mean unnormalized forward transfer over tasks 1..N-1.
 
         average_area_forward_transfer:
-            Mean area-based normalized forward transfer over tasks.
+            Mean area-based normalized forward transfer over tasks 1..N-1.
 
         final_per_task:
             Final success rate for every task.
@@ -268,7 +269,7 @@ def compute_forward_transfer(
                 - mean(single_task_baseline_curve_i)
             )
 
-        A baseline mean success of 1.0 is rejected because normalized
+        A baseline mean success of 1.0 produces NaN because normalized
         forward transfer has zero remaining headroom.
 
     Args:
@@ -355,10 +356,7 @@ def compute_forward_transfer(
             remaining_headroom
             <= _DENOMINATOR_TOLERANCE
         ):
-            raise ValueError(
-                "Normalized forward transfer is undefined when the "
-                "single-task baseline mean is 1.0."
-            )
+            normalized_transfer.append(float("nan"))
         else:
             normalized_value = (
                 raw_value
@@ -393,8 +391,7 @@ def compute_area_forward_transfer(
 
     The integrals are approximated with the trapezoidal rule over the
     shared evaluation grid index. A baseline curve with zero remaining
-    headroom area is rejected because the normalized metric is
-    undefined.
+    headroom area produces NaN because the normalized metric is undefined.
     """
     continual_curves = _validate_curve_collection(
         active_task_success_curves,
@@ -456,13 +453,8 @@ def compute_area_forward_transfer(
         )
 
         if denominator <= _DENOMINATOR_TOLERANCE:
-            if continual_curve.size < 2 and abs(numerator) <= _DENOMINATOR_TOLERANCE:
-                area_transfer.append(0.0)
-                continue
-            raise ValueError(
-                "Area forward transfer is undefined when the "
-                "single-task baseline headroom area is zero."
-            )
+            area_transfer.append(float("nan"))
+            continue
 
         area_transfer.append(
             numerator / denominator
@@ -584,16 +576,26 @@ def compute_continual_metrics(
         np.mean(forgetting_per_task)
     )
 
+    # The first task has no preceding knowledge and therefore cannot measure
+    # forward transfer. Keep its per-task diagnostic, but exclude it from all
+    # aggregate FT metrics in multi-task sequences.
+    transfer_start_index = 1 if task_count > 1 else 0
     average_raw_forward_transfer = float(
-        np.mean(raw_forward_transfer)
+        np.mean(raw_forward_transfer[transfer_start_index:])
     )
 
-    average_area_forward_transfer = float(
-        np.mean(area_forward_transfer)
+    area_transfer_array = np.asarray(
+        area_forward_transfer[transfer_start_index:],
+        dtype=np.float64,
+    )
+    average_area_forward_transfer = (
+        float("nan")
+        if np.all(np.isnan(area_transfer_array))
+        else float(np.nanmean(area_transfer_array))
     )
 
     normalized_transfer_array = np.asarray(
-        normalized_forward_transfer,
+        normalized_forward_transfer[transfer_start_index:],
         dtype=np.float64,
     )
 
@@ -779,15 +781,14 @@ def _validate_result_is_finite(
 ) -> None:
     """Validate required metrics and permitted undefined normalized FT.
 
-    Average Performance, Forgetting, raw FT, and all corresponding
-    per-task values must remain finite. Normalized FT may be NaN only
-    when a task's independent baseline mean success is 1.0.
+    Average Performance, Forgetting, raw FT, and their corresponding
+    per-task values must remain finite. Normalized and area FT may be
+    NaN when their normalization denominator has zero headroom/area.
     """
     required_scalar_values = (
         result.average_performance,
         result.average_forgetting,
         result.average_raw_forward_transfer,
-        result.average_area_forward_transfer,
     )
 
     if not all(
@@ -799,17 +800,15 @@ def _validate_result_is_finite(
             "non-finite."
         )
 
-    if not (
-        math.isfinite(
-            result.average_forward_transfer
-        )
-        or math.isnan(
-            result.average_forward_transfer
+    if not all(
+        math.isfinite(value) or math.isnan(value)
+        for value in (
+            result.average_forward_transfer,
+            result.average_area_forward_transfer,
         )
     ):
         raise RuntimeError(
-            "Average normalized forward transfer must be finite "
-            "or NaN."
+            "Average normalized/area forward transfer must be finite or NaN."
         )
 
     required_sequence_values = (
@@ -817,7 +816,6 @@ def _validate_result_is_finite(
         result.end_of_task_per_task,
         result.forgetting_per_task,
         result.raw_forward_transfer_per_task,
-        result.area_forward_transfer_per_task,
     )
 
     if not all(
@@ -833,11 +831,12 @@ def _validate_result_is_finite(
     if not all(
         math.isfinite(value)
         or math.isnan(value)
-        for value in (
-            result.normalized_forward_transfer_per_task
+        for sequence in (
+            result.normalized_forward_transfer_per_task,
+            result.area_forward_transfer_per_task,
         )
+        for value in sequence
     ):
         raise RuntimeError(
-            "Normalized forward transfer values must be finite "
-            "or NaN."
+            "Normalized/area forward transfer values must be finite or NaN."
         )

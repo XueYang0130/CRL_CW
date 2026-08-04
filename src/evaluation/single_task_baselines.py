@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+import numpy as np
+
 
 _REQUIRED_EVALUATION_FIELDS = (
     "environment_step",
@@ -83,6 +85,295 @@ class BaselineAggregationResult:
     deterministic_return_csv_path: Path
     task_summaries_csv_path: Path
     summary_json_path: Path
+
+
+def aggregate_single_task_seed_batches(
+    *,
+    batch_directories: Sequence[str | Path],
+    output_directory: str | Path,
+    tail_size: int = 5,
+) -> BaselineAggregationResult:
+    """Average aligned single-task baseline curves across independent seeds."""
+    if len(batch_directories) < 2:
+        raise ValueError("At least two seed batch directories are required.")
+    if tail_size <= 0:
+        raise ValueError("tail_size must be positive.")
+
+    batch_paths = [Path(path).expanduser().resolve() for path in batch_directories]
+    configurations = [
+        _read_json_object(path / "batch_config.json") for path in batch_paths
+    ]
+    curve_payloads = [
+        _read_json_object(path / "aggregate" / "baseline_curves.json")
+        for path in batch_paths
+    ]
+
+    protocol_fields = (
+        "tasks",
+        "env_version",
+        "reward_function_version",
+        "steps_per_task",
+        "eval_every",
+        "det_eval_episodes",
+        "stoch_eval_episodes",
+        "max_episode_steps",
+    )
+    reference_configuration = configurations[0]
+    for batch_index, configuration in enumerate(configurations[1:], start=1):
+        for field in protocol_fields:
+            if configuration.get(field) != reference_configuration.get(field):
+                raise ValueError(
+                    "Single-task seed batches use different protocols: "
+                    f"batch={batch_index}, field={field!r}."
+                )
+
+    seeds = [_required_int(configuration, "seed") for configuration in configurations]
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("Each single-task batch must use a distinct seed.")
+
+    curve_fields = (
+        "tasks",
+        "evaluation_steps",
+        "stochastic_success_curves",
+        "stochastic_return_curves",
+    )
+    reference_curves = curve_payloads[0]
+    for batch_index, payload in enumerate(curve_payloads[1:], start=1):
+        for field in curve_fields[:2]:
+            if payload.get(field) != reference_curves.get(field):
+                raise ValueError(
+                    "Single-task seed aggregates are not aligned: "
+                    f"batch={batch_index}, field={field!r}."
+                )
+
+    success_stack = _stack_seed_curves(
+        curve_payloads,
+        field="stochastic_success_curves",
+    )
+    return_stack = _stack_seed_curves(
+        curve_payloads,
+        field="stochastic_return_curves",
+    )
+    expected_curve_shape = (
+        len(reference_configuration["tasks"]),
+        len(reference_curves["evaluation_steps"]),
+    )
+    if success_stack.shape[1:] != expected_curve_shape:
+        raise ValueError(
+            "Single-task curve dimensions do not match the declared task "
+            f"and evaluation grids: {success_stack.shape[1:]} != "
+            f"{expected_curve_shape}."
+        )
+    for batch_index, payload in enumerate(curve_payloads):
+        source_runs = payload.get("source_run_directories")
+        if not isinstance(source_runs, list) or len(source_runs) != len(
+            reference_configuration["tasks"]
+        ):
+            raise ValueError(
+                "Each seed aggregate must identify one source run per task: "
+                f"batch={batch_index}."
+            )
+    mean_success = np.mean(success_stack, axis=0)
+    mean_return = np.mean(return_stack, axis=0)
+
+    tasks = list(reference_configuration["tasks"])
+    evaluation_steps = list(reference_curves["evaluation_steps"])
+    destination = Path(output_directory).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    created_at_utc = datetime.now(timezone.utc).isoformat()
+
+    curves_json_path = destination / "baseline_curves.json"
+    long_curves_csv_path = destination / "baseline_curves_long.csv"
+    stochastic_success_csv_path = destination / "stochastic_success_curves.csv"
+    deterministic_success_csv_path = destination / "deterministic_success_curves.csv"
+    stochastic_return_csv_path = destination / "stochastic_return_curves.csv"
+    deterministic_return_csv_path = destination / "deterministic_return_curves.csv"
+    task_summaries_csv_path = destination / "task_summaries.csv"
+    summary_json_path = destination / "summary.json"
+
+    _write_wide_curve_csv(
+        path=stochastic_success_csv_path,
+        evaluation_steps=evaluation_steps,
+        tasks=tasks,
+        curves=mean_success.tolist(),
+    )
+    _write_wide_curve_csv(
+        path=stochastic_return_csv_path,
+        evaluation_steps=evaluation_steps,
+        tasks=tasks,
+        curves=mean_return.tolist(),
+    )
+    _write_disabled_curve_csv(deterministic_success_csv_path)
+    _write_disabled_curve_csv(deterministic_return_csv_path)
+
+    long_rows: list[dict[str, Any]] = []
+    for seed_index, seed in enumerate(seeds):
+        for task_index, task_name in enumerate(tasks):
+            for evaluation_index, environment_step in enumerate(evaluation_steps):
+                long_rows.append(
+                    {
+                        "seed": seed,
+                        "task_index": task_index,
+                        "task_name": task_name,
+                        "evaluation_index": evaluation_index + 1,
+                        "environment_step": environment_step,
+                        "stochastic_success_rate": success_stack[
+                            seed_index, task_index, evaluation_index
+                        ],
+                        "stochastic_average_return": return_stack[
+                            seed_index, task_index, evaluation_index
+                        ],
+                        "source_batch_directory": str(batch_paths[seed_index]),
+                    }
+                )
+    multi_seed_long_fields = (
+        "seed",
+        "task_index",
+        "task_name",
+        "evaluation_index",
+        "environment_step",
+        "stochastic_success_rate",
+        "stochastic_average_return",
+        "source_batch_directory",
+    )
+    _write_csv(
+        path=long_curves_csv_path,
+        fieldnames=list(multi_seed_long_fields),
+        rows=long_rows,
+    )
+
+    task_summary_rows: list[dict[str, Any]] = []
+    selected_count = min(tail_size, mean_success.shape[1])
+    for task_index, task_name in enumerate(tasks):
+        seed_final = success_stack[:, task_index, -1]
+        seed_tail = np.mean(
+            success_stack[:, task_index, -selected_count:], axis=1
+        )
+        source_run_directories = [
+            str(payload["source_run_directories"][task_index])
+            for payload in curve_payloads
+        ]
+        task_summary_rows.append(
+            {
+                "task_index": task_index,
+                "task_name": task_name,
+                "seed": "|".join(str(seed) for seed in seeds),
+                "num_runs_averaged": len(seeds),
+                "num_seeds": len(seeds),
+                "seeds": "|".join(str(seed) for seed in seeds),
+                "num_evaluation_points": len(evaluation_steps),
+                "final_stochastic_success": float(np.mean(seed_final)),
+                "tail_mean_stochastic_success": float(np.mean(seed_tail)),
+                "maximum_stochastic_success": float(
+                    np.max(mean_success[task_index])
+                ),
+                "mean_final_stochastic_success": float(np.mean(seed_final)),
+                "std_final_stochastic_success": float(np.std(seed_final)),
+                "mean_tail_stochastic_success": float(np.mean(seed_tail)),
+                "std_tail_stochastic_success": float(np.std(seed_tail)),
+                "final_stochastic_return": float(
+                    np.mean(return_stack[:, task_index, -1])
+                ),
+                "tail_mean_stochastic_return": float(
+                    np.mean(mean_return[task_index, -selected_count:])
+                ),
+                "maximum_stochastic_return": float(
+                    np.max(mean_return[task_index])
+                ),
+                "mean_final_stochastic_return": float(
+                    np.mean(return_stack[:, task_index, -1])
+                ),
+                "source_run_directories": "|".join(source_run_directories),
+            }
+        )
+    task_summary_fields = tuple(task_summary_rows[0].keys())
+    _write_csv(
+        path=task_summaries_csv_path,
+        fieldnames=list(task_summary_fields),
+        rows=task_summary_rows,
+    )
+
+    curves_payload = {
+        "schema_version": 3,
+        "method": "single_task_baseline",
+        "evaluation_protocol": "stochastic",
+        "aggregation": "checkpoint_wise_mean_across_seeds",
+        "created_at_utc": created_at_utc,
+        "tasks": tasks,
+        "num_tasks": len(tasks),
+        "seeds": seeds,
+        "num_seeds": len(seeds),
+        "source_batch_directories": [str(path) for path in batch_paths],
+        "env_version": reference_configuration["env_version"],
+        "reward_function_version": reference_configuration[
+            "reward_function_version"
+        ],
+        "steps_per_task": reference_configuration["steps_per_task"],
+        "eval_every": reference_configuration["eval_every"],
+        "det_eval_episodes": reference_configuration["det_eval_episodes"],
+        "stoch_eval_episodes": reference_configuration["stoch_eval_episodes"],
+        "max_episode_steps": reference_configuration["max_episode_steps"],
+        "evaluation_steps": evaluation_steps,
+        "deterministic_success_curves": None,
+        "deterministic_return_curves": None,
+        "stochastic_success_curves": mean_success.tolist(),
+        "stochastic_return_curves": mean_return.tolist(),
+    }
+    _write_json(curves_json_path, curves_payload)
+
+    summary_payload = {
+        **curves_payload,
+        "forward_transfer_ready": True,
+        "forward_transfer_curve_key": "stochastic_success_curves",
+        "tail_size": tail_size,
+        "mean_final_stochastic_success": float(np.mean(mean_success[:, -1])),
+        "mean_tail_stochastic_success": float(
+            np.mean(mean_success[:, -selected_count:])
+        ),
+        "mean_final_stochastic_return": float(np.mean(mean_return[:, -1])),
+        "curves_json": str(curves_json_path),
+        "long_curves_csv": str(long_curves_csv_path),
+        "stochastic_success_csv": str(stochastic_success_csv_path),
+        "stochastic_return_csv": str(stochastic_return_csv_path),
+        "task_summaries_csv": str(task_summaries_csv_path),
+    }
+    _write_json(summary_json_path, summary_payload)
+
+    return BaselineAggregationResult(
+        output_directory=destination,
+        curves_json_path=curves_json_path,
+        long_curves_csv_path=long_curves_csv_path,
+        stochastic_success_csv_path=stochastic_success_csv_path,
+        deterministic_success_csv_path=deterministic_success_csv_path,
+        stochastic_return_csv_path=stochastic_return_csv_path,
+        deterministic_return_csv_path=deterministic_return_csv_path,
+        task_summaries_csv_path=task_summaries_csv_path,
+        summary_json_path=summary_json_path,
+    )
+
+
+def _stack_seed_curves(
+    payloads: Sequence[dict[str, Any]],
+    *,
+    field: str,
+) -> np.ndarray:
+    arrays = [np.asarray(payload.get(field), dtype=np.float64) for payload in payloads]
+    reference_shape = arrays[0].shape
+    if len(reference_shape) != 2 or 0 in reference_shape:
+        raise ValueError(f"{field} must be a non-empty task-by-checkpoint matrix.")
+    for batch_index, array in enumerate(arrays):
+        if array.shape != reference_shape:
+            raise ValueError(
+                f"{field} shape mismatch for batch {batch_index}: "
+                f"{array.shape} != {reference_shape}."
+            )
+        if not np.all(np.isfinite(array)):
+            raise ValueError(f"{field} contains non-finite values in batch {batch_index}.")
+    if field == "stochastic_success_curves" and (
+        np.any(np.stack(arrays) < 0.0) or np.any(np.stack(arrays) > 1.0)
+    ):
+        raise ValueError("Stochastic success curves must lie in [0, 1].")
+    return np.stack(arrays, axis=0)
 
 
 def aggregate_single_task_baselines(

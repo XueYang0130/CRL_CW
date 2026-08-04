@@ -1,0 +1,97 @@
+<svg width="1800" height="1100" viewBox="0 0 1800 1100" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #17232f; }
+      .label { font: 700 22px Arial, sans-serif; fill: #17232f; }
+      .sub { font: 600 16px Arial, sans-serif; fill: #4a5b6c; }
+      .boxA { fill: #EEF5FF; stroke: #4E79A7; stroke-width: 3; }
+      .boxB { fill: #EEF9F2; stroke: #2F8F5B; stroke-width: 3; }
+      .boxC { fill: #FFF5E8; stroke: #CC8A2E; stroke-width: 3; }
+      .boxD { fill: #F5F1FF; stroke: #7B61C8; stroke-width: 3; }
+      .boxE { fill: #FFF0F0; stroke: #C85A5A; stroke-width: 3; stroke-dasharray: 10 8; }
+      .group { fill: none; stroke: #C7D2DD; stroke-width: 2.5; stroke-dasharray: 10 8; }
+      .arrow { stroke: #5A6C7E; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .dash { stroke-dasharray: 10 8; }
+    </style>
+    <marker id="arrowhead" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto">
+      <path d="M0,0 L14,7 L0,14 z" fill="#5A6C7E"/>
+    </marker>
+  </defs>
+
+  <rect width="1800" height="1100" fill="white"/>
+  <text x="70" y="65" class="title">Component Diagram</text>
+
+  <rect x="60" y="110" width="1680" height="910" rx="24" class="group"/>
+
+  <rect x="110" y="170" width="240" height="110" rx="20" class="boxD"/>
+  <text x="155" y="225" class="label">Task Stream</text>
+  <text x="170" y="255" class="sub">CW10 Sequence</text>
+
+  <rect x="430" y="170" width="270" height="110" rx="20" class="boxA"/>
+  <text x="480" y="225" class="label">Environment</text>
+  <text x="472" y="255" class="sub">Meta-World v3</text>
+
+  <rect x="790" y="130" width="420" height="190" rx="24" class="boxB"/>
+  <text x="895" y="185" class="label">Continual SAC Learner</text>
+  <text x="905" y="225" class="sub">Shared Backbone</text>
+  <text x="930" y="255" class="sub">Task-specific Heads</text>
+  <text x="890" y="285" class="sub">Current Task Training Core</text>
+
+  <rect x="1300" y="170" width="300" height="110" rx="20" class="boxC"/>
+  <text x="1350" y="225" class="label">Online Replay</text>
+  <text x="1406" y="255" class="sub">Current Task Buffer</text>
+
+  <rect x="140" y="440" width="300" height="130" rx="20" class="boxA"/>
+  <text x="195" y="495" class="label">Old Successful Rollouts</text>
+  <text x="196" y="528" class="sub">Completed Tasks Only</text>
+
+  <rect x="530" y="410" width="350" height="190" rx="24" class="boxB"/>
+  <text x="617" y="465" class="label">Semantic Segmenter</text>
+  <text x="612" y="505" class="sub">General Labels</text>
+  <text x="595" y="535" class="sub">Task-specific Labels</text>
+  <text x="610" y="565" class="sub">task_aware_v3</text>
+
+  <rect x="950" y="410" width="360" height="190" rx="24" class="boxC"/>
+  <text x="1030" y="465" class="label">Memory Constructor</text>
+  <text x="1062" y="505" class="sub">General Channel</text>
+  <text x="1045" y="535" class="sub">Background Channel</text>
+  <text x="1035" y="565" class="sub">Task-specific Channel</text>
+
+  <rect x="1390" y="410" width="280" height="190" rx="24" class="boxE"/>
+  <text x="1465" y="465" class="label">Controller</text>
+  <text x="1468" y="505" class="sub">LLM Gate</text>
+  <text x="1440" y="535" class="sub">Dynamic Selection</text>
+  <text x="1418" y="565" class="sub">Gradient-aware Gate</text>
+
+  <rect x="260" y="740" width="340" height="120" rx="20" class="boxC"/>
+  <text x="325" y="795" class="label">BC Memory Bank</text>
+  <text x="325" y="825" class="sub">Reference States + Targets</text>
+
+  <rect x="700" y="700" width="420" height="200" rx="24" class="boxB"/>
+  <text x="820" y="760" class="label">Actor Update Module</text>
+  <text x="810" y="805" class="sub">SAC Loss</text>
+  <text x="950" y="805" class="sub">+</text>
+  <text x="995" y="805" class="sub">KL BC Loss</text>
+  <text x="806" y="845" class="sub">Shared Parameters Update</text>
+
+  <rect x="1240" y="740" width="320" height="120" rx="20" class="boxD"/>
+  <text x="1300" y="795" class="label">Task Policy Bank</text>
+  <text x="1320" y="825" class="sub">Old Heads / Targets</text>
+
+  <path d="M350 225 C385 225, 395 225, 430 225" class="arrow"/>
+  <path d="M700 225 C740 225, 748 225, 790 225" class="arrow"/>
+  <path d="M1210 225 C1248 225, 1260 225, 1300 225" class="arrow"/>
+
+  <path d="M440 505 C475 505, 490 505, 530 505" class="arrow"/>
+  <path d="M880 505 C910 505, 920 505, 950 505" class="arrow"/>
+  <path d="M1310 505 C1340 505, 1350 505, 1390 505" class="arrow dash"/>
+
+  <path d="M1130 600 C1110 660, 980 685, 920 700" class="arrow"/>
+  <path d="M530 600 C500 665, 420 700, 430 740" class="arrow"/>
+  <path d="M1390 600 C1355 665, 1320 690, 1300 740" class="arrow dash"/>
+  <path d="M600 800 C640 800, 650 800, 700 800" class="arrow"/>
+  <path d="M1120 800 C1160 800, 1180 800, 1240 800" class="arrow"/>
+
+  <text x="90" y="1010" class="sub">Solid modules: confirmed implementation components</text>
+  <text x="760" y="1010" class="sub">Dashed red module: evolving design space</text>
+</svg>

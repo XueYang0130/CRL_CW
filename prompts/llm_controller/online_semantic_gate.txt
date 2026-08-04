@@ -1,0 +1,37 @@
+You are an online semantic replay controller for continual reinforcement learning.
+
+Execution protocol:
+$protocol
+
+Previous task profile:
+$previous_task_profile
+
+Current task profile:
+$current_task_profile
+
+Current training state:
+$training_state
+
+Available replay segment counts:
+$available_segment_counts
+
+Available task-specific memory counts from completed tasks only:
+$available_task_specific_counts
+
+Choose the semantic replay distribution for the next training stage. Use the task descriptions, interaction structures, task-specific semantic refinements, current learning curve, and available memory. Prefer a compact subset, but retain a necessary terminal or stabilization segment when forgetting risk is high.
+
+The task-specific labels are a fixed side channel sampled only from completed-task memory. Use their availability to reason about protected old-task skills, but select only from the available general segment names. You cannot select, remove, or reweight the task-specific side channel.
+
+Return JSON only with these keys:
+- "selected_segments": one to three available segment names
+- "priority": the selected segment names in descending importance
+- "weights": a probability for every selected segment
+- "reason": a two-to-six-word explanation
+
+Constraints:
+- Every selected segment must have positive available memory.
+- Every weight must be strictly positive.
+- The weights must sum to exactly 1.0.
+- Do not return unselected segments in priority or weights.
+- Do not output prose or markdown outside the JSON object.
+- Return one minified JSON object on one line.

@@ -24,6 +24,7 @@ class TestSegmentSelection(unittest.TestCase):
             SegmentSelection(
                 selected_segments=("contact_or_alignment", "manipulation"),
                 priority=("contact_or_alignment", "manipulation"),
+                weights=(("contact_or_alignment", 0.5), ("manipulation", 0.5)),
                 reason="No segment selection manifest provided.",
                 selection_source="default",
             ),
@@ -44,6 +45,11 @@ class TestSegmentSelection(unittest.TestCase):
                         "contact_or_alignment",
                         "manipulation",
                     ],
+                    "weights": {
+                        "approach": 0.5,
+                        "contact_or_alignment": 1.0,
+                        "manipulation": 1.0,
+                    },
                     "reason": "Multi-stage tool use requires richer preservation.",
                 }
             },
@@ -59,6 +65,8 @@ class TestSegmentSelection(unittest.TestCase):
             ("approach", "contact_or_alignment", "manipulation"),
         )
         self.assertEqual(result.selection_source, "manifest")
+        self.assertEqual(dict(result.weights)["approach"], 0.2)
+        self.assertAlmostEqual(sum(dict(result.weights).values()), 1.0)
 
     def test_manifest_loader(self) -> None:
         payload = {"default_segments": ["contact_or_alignment", "manipulation"], "pairs": {}}
@@ -85,6 +93,35 @@ class TestSegmentSelection(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.selected_segments, ("finish_or_stabilize",))
         self.assertEqual(result.selection_source, "task_specific_manifest")
+
+    def test_rejects_duplicate_segments_and_unselected_priority(self) -> None:
+        duplicate_manifest = {
+            "default_segments": ["manipulation", "manipulation"],
+        }
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            select_segments_for_task_pair(
+                previous_task_name=None,
+                new_task_name="hammer-v3",
+                manifest=duplicate_manifest,
+                fallback_segments=["manipulation"],
+            )
+
+        invalid_priority_manifest = {
+            "default_segments": ["manipulation"],
+            "pairs": {
+                "hammer-v3->push-wall-v3": {
+                    "selected_segments": ["manipulation"],
+                    "priority": ["approach"],
+                }
+            },
+        }
+        with self.assertRaisesRegex(ValueError, "unselected"):
+            select_segments_for_task_pair(
+                previous_task_name="hammer-v3",
+                new_task_name="push-wall-v3",
+                manifest=invalid_priority_manifest,
+                fallback_segments=["manipulation"],
+            )
 
 
 if __name__ == "__main__":

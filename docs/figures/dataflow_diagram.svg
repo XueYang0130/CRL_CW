@@ -1,0 +1,100 @@
+<svg width="1800" height="1050" viewBox="0 0 1800 1050" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #17232f; }
+      .label { font: 700 22px Arial, sans-serif; fill: #17232f; }
+      .sub { font: 600 16px Arial, sans-serif; fill: #4a5b6c; }
+      .boxA { fill: #EEF5FF; stroke: #4E79A7; stroke-width: 3; }
+      .boxB { fill: #EEF9F2; stroke: #2F8F5B; stroke-width: 3; }
+      .boxC { fill: #FFF5E8; stroke: #CC8A2E; stroke-width: 3; }
+      .boxD { fill: #F5F1FF; stroke: #7B61C8; stroke-width: 3; }
+      .boxE { fill: #FFF0F0; stroke: #C85A5A; stroke-width: 3; stroke-dasharray: 10 8; }
+      .arrow { stroke: #5A6C7E; stroke-width: 3; fill: none; marker-end: url(#arrowhead); }
+      .dash { stroke-dasharray: 10 8; }
+      .flow { font: 600 15px Arial, sans-serif; fill: #5A6C7E; }
+    </style>
+    <marker id="arrowhead" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto">
+      <path d="M0,0 L14,7 L0,14 z" fill="#5A6C7E"/>
+    </marker>
+  </defs>
+
+  <rect width="1800" height="1050" fill="white"/>
+  <text x="70" y="65" class="title">Dataflow Diagram</text>
+
+  <rect x="100" y="140" width="260" height="100" rx="20" class="boxD"/>
+  <text x="155" y="198" class="label">Current Task Data</text>
+
+  <rect x="450" y="140" width="320" height="100" rx="20" class="boxA"/>
+  <text x="545" y="198" class="label">Online Replay Buffer</text>
+
+  <rect x="880" y="120" width="360" height="140" rx="24" class="boxB"/>
+  <text x="975" y="180" class="label">SAC Update Path</text>
+  <text x="983" y="218" class="sub">Actor / Critic Learning</text>
+
+  <rect x="140" y="390" width="320" height="120" rx="20" class="boxA"/>
+  <text x="190" y="450" class="label">Old Successful Rollouts</text>
+
+  <rect x="560" y="360" width="320" height="180" rx="24" class="boxB"/>
+  <text x="638" y="420" class="label">Semantic Segmentation</text>
+  <text x="650" y="458" class="sub">General / Task-specific</text>
+  <text x="666" y="490" class="sub">Segment Pools</text>
+
+  <rect x="980" y="360" width="360" height="180" rx="24" class="boxC"/>
+  <text x="1072" y="420" class="label">Memory Selection</text>
+  <text x="1048" y="458" class="sub">General + Background</text>
+  <text x="1072" y="490" class="sub">+ Task-specific</text>
+
+  <rect x="1440" y="360" width="250" height="180" rx="24" class="boxE"/>
+  <text x="1505" y="420" class="label">Controller</text>
+  <text x="1512" y="458" class="sub">LLM / Dynamic Gate</text>
+
+  <rect x="270" y="700" width="360" height="120" rx="20" class="boxC"/>
+  <text x="352" y="760" class="label">Reference Memory Batch</text>
+
+  <rect x="760" y="660" width="440" height="200" rx="24" class="boxB"/>
+  <text x="855" y="725" class="label">BC Update Path</text>
+  <text x="860" y="765" class="sub">Old Policy Targets</text>
+  <text x="1026" y="765" class="sub">+</text>
+  <text x="1060" y="765" class="sub">Current Old Head Outputs</text>
+  <text x="915" y="805" class="sub">Gaussian KL Loss</text>
+
+  <rect x="1320" y="690" width="320" height="140" rx="24" class="boxD"/>
+  <text x="1398" y="748" class="label">Final Actor Update</text>
+  <text x="1390" y="786" class="sub">SAC Loss + BC Loss</text>
+
+  <path d="M360 190 C395 190, 410 190, 450 190" class="arrow"/>
+  <text x="385" y="170" class="flow">store transitions</text>
+
+  <path d="M770 190 C810 190, 830 190, 880 190" class="arrow"/>
+  <text x="790" y="170" class="flow">sample online batch</text>
+
+  <path d="M460 450 C500 450, 515 450, 560 450" class="arrow"/>
+  <text x="470" y="430" class="flow">successful trajectories</text>
+
+  <path d="M880 450 C920 450, 935 450, 980 450" class="arrow"/>
+  <text x="890" y="430" class="flow">segment pools</text>
+
+  <path d="M1340 450 C1370 450, 1390 450, 1440 450" class="arrow dash"/>
+  <text x="1360" y="430" class="flow">selection signal</text>
+
+  <path d="M1160 540 C1135 620, 960 645, 930 660" class="arrow"/>
+  <text x="1015" y="610" class="flow">selected old states + targets</text>
+
+  <path d="M630 760 C680 760, 700 760, 760 760" class="arrow"/>
+  <text x="645" y="740" class="flow">reference batch</text>
+
+  <path d="M1200 760 C1240 760, 1260 760, 1320 760" class="arrow"/>
+  <text x="1225" y="740" class="flow">BC gradient</text>
+
+  <path d="M1060 260 C1060 310, 1060 320, 1060 360" class="arrow"/>
+  <text x="1080" y="320" class="flow">old policy targets</text>
+
+  <path d="M1060 540 C1060 590, 1060 610, 1060 660" class="arrow"/>
+  <text x="1082" y="610" class="flow">selected memory</text>
+
+  <path d="M1060 860 C1060 915, 1060 915, 1060 960" class="arrow"/>
+  <text x="1090" y="930" class="flow">continual loop</text>
+
+  <rect x="930" y="960" width="260" height="50" rx="16" class="boxA"/>
+  <text x="983" y="992" class="sub">Next Task Iteration</text>
+</svg>

@@ -1,0 +1,90 @@
+<svg width="1800" height="980" viewBox="0 0 1800 980" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #13202b; }
+      .label { font: 700 22px Arial, sans-serif; fill: #13202b; }
+      .small { font: 600 18px Arial, sans-serif; fill: #415260; }
+      .boxA { fill: #EEF5FF; stroke: #4E79A7; stroke-width: 3; }
+      .boxB { fill: #EEF9F2; stroke: #2F8F5B; stroke-width: 3; }
+      .boxC { fill: #FFF5E8; stroke: #CC8A2E; stroke-width: 3; }
+      .boxD { fill: #F8F0FF; stroke: #8B5FBF; stroke-width: 3; }
+      .boxE { fill: #FFF0F0; stroke: #C85A5A; stroke-width: 3; stroke-dasharray: 10 8; }
+      .arrow { stroke: #506273; stroke-width: 3.2; fill: none; marker-end: url(#arrowhead); }
+      .dash { stroke-dasharray: 10 8; }
+    </style>
+    <marker id="arrowhead" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto">
+      <path d="M0,0 L14,7 L0,14 z" fill="#506273"/>
+    </marker>
+  </defs>
+
+  <rect width="1800" height="980" fill="white"/>
+
+  <text x="70" y="70" class="title">Framework Overview</text>
+
+  <rect x="70" y="140" width="250" height="100" rx="20" class="boxD"/>
+  <text x="110" y="200" class="label">Task Stream</text>
+
+  <rect x="390" y="140" width="330" height="100" rx="20" class="boxA"/>
+  <text x="448" y="200" class="label">Current Task Environment</text>
+
+  <rect x="790" y="110" width="360" height="160" rx="24" class="boxB"/>
+  <text x="875" y="165" class="label">Continual SAC Learner</text>
+  <text x="850" y="205" class="small">Shared Backbone</text>
+  <text x="893" y="235" class="small">Task Heads</text>
+
+  <rect x="1230" y="140" width="260" height="100" rx="20" class="boxC"/>
+  <text x="1268" y="200" class="label">Online Replay Buffer</text>
+
+  <rect x="120" y="370" width="300" height="100" rx="20" class="boxA"/>
+  <text x="175" y="430" class="label">Successful Old Rollouts</text>
+
+  <rect x="500" y="320" width="360" height="200" rx="24" class="boxB"/>
+  <text x="603" y="375" class="label">Semantic Segmenter</text>
+  <text x="570" y="420" class="small">General Segments</text>
+  <text x="555" y="455" class="small">Task-specific Segments</text>
+
+  <rect x="950" y="320" width="360" height="200" rx="24" class="boxC"/>
+  <text x="1034" y="375" class="label">Memory Constructor</text>
+  <text x="1075" y="420" class="small">General Channel</text>
+  <text x="1060" y="455" class="small">Background Channel</text>
+  <text x="1048" y="490" class="small">Task-specific Channel</text>
+
+  <rect x="1400" y="320" width="280" height="200" rx="24" class="boxE"/>
+  <text x="1481" y="375" class="label">Controller</text>
+  <text x="1490" y="420" class="small">LLM Gate</text>
+  <text x="1458" y="455" class="small">Dynamic Selection</text>
+  <text x="1450" y="490" class="small">Gradient-aware Gate</text>
+
+  <rect x="340" y="660" width="380" height="120" rx="24" class="boxC"/>
+  <text x="458" y="718" class="label">Behavior Cloning Memory</text>
+
+  <rect x="850" y="630" width="400" height="180" rx="24" class="boxB"/>
+  <text x="945" y="690" class="label">Actor Update</text>
+  <text x="932" y="730" class="small">SAC Loss</text>
+  <text x="1072" y="730" class="small">+</text>
+  <text x="1110" y="730" class="small">KL BC Loss</text>
+
+  <rect x="1360" y="660" width="300" height="120" rx="24" class="boxD"/>
+  <text x="1436" y="718" class="label">Next Task Policy</text>
+
+  <path d="M320 190 C345 190, 355 190, 390 190" class="arrow"/>
+  <path d="M720 190 C745 190, 755 190, 790 190" class="arrow"/>
+  <path d="M1150 190 C1175 190, 1190 190, 1230 190" class="arrow"/>
+  <path d="M1360 240 C1360 275, 1360 275, 1360 320" class="arrow dash"/>
+
+  <path d="M420 420 C445 420, 455 420, 500 420" class="arrow"/>
+  <path d="M860 420 C885 420, 900 420, 950 420" class="arrow"/>
+  <path d="M1310 420 C1335 420, 1350 420, 1400 420" class="arrow dash"/>
+
+  <path d="M1130 520 C1130 565, 970 590, 720 690" class="arrow"/>
+  <path d="M1540 520 C1540 575, 1345 585, 1180 660" class="arrow dash"/>
+
+  <path d="M720 720 C760 720, 785 720, 850 720" class="arrow"/>
+  <path d="M1250 720 C1285 720, 1300 720, 1360 720" class="arrow"/>
+
+  <path d="M970 270 C970 290, 970 295, 970 320" class="arrow"/>
+  <path d="M970 810 C970 860, 970 860, 970 900" class="arrow"/>
+
+  <rect x="830" y="900" width="280" height="50" rx="16" class="boxA"/>
+  <text x="875" y="933" class="small">Continual Learning Loop</text>
+</svg>

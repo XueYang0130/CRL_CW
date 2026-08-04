@@ -10,10 +10,110 @@ from pathlib import Path
 
 from evaluation.single_task_baselines import (
     aggregate_single_task_baselines,
+    aggregate_single_task_seed_batches,
 )
 
 
 class SingleTaskBaselineAggregationTests(unittest.TestCase):
+    def test_multi_seed_aggregation_averages_aligned_curves(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            batch_directories = []
+            seed_curves = (
+                [[0.0, 0.4], [0.2, 0.6]],
+                [[0.2, 0.8], [0.4, 1.0]],
+            )
+            for seed, curves in enumerate(seed_curves, start=1):
+                batch_directory = root / f"seed{seed}"
+                aggregate_directory = batch_directory / "aggregate"
+                aggregate_directory.mkdir(parents=True)
+                configuration = {
+                    "tasks": ["hammer-v3", "push-wall-v3"],
+                    "env_version": "v3",
+                    "reward_function_version": "cw10_v1",
+                    "seed": seed,
+                    "steps_per_task": 1_000,
+                    "eval_every": 500,
+                    "det_eval_episodes": 0,
+                    "stoch_eval_episodes": 5,
+                    "max_episode_steps": 200,
+                }
+                self._write_json(
+                    batch_directory / "batch_config.json",
+                    configuration,
+                )
+                self._write_json(
+                    aggregate_directory / "baseline_curves.json",
+                    {
+                        "tasks": configuration["tasks"],
+                        "evaluation_steps": [500, 1_000],
+                        "stochastic_success_curves": curves,
+                        "stochastic_return_curves": [
+                            [value * 10.0 for value in curve]
+                            for curve in curves
+                        ],
+                        "source_run_directories": [
+                            f"seed{seed}/hammer",
+                            f"seed{seed}/push-wall",
+                        ],
+                    },
+                )
+                batch_directories.append(batch_directory)
+
+            result = aggregate_single_task_seed_batches(
+                batch_directories=batch_directories,
+                output_directory=root / "combined",
+            )
+            with result.curves_json_path.open("r", encoding="utf-8") as file:
+                payload = json.load(file)
+
+            self.assertEqual(payload["seeds"], [1, 2])
+            self.assertEqual(payload["num_seeds"], 2)
+            self.assertEqual(
+                payload["stochastic_success_curves"],
+                [[0.1, 0.6000000000000001], [0.30000000000000004, 0.8]],
+            )
+
+    def test_multi_seed_aggregation_rejects_protocol_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            batch_directories = []
+            for seed, reward_version in ((1, "cw10_v1"), (2, "v2")):
+                batch_directory = root / f"seed{seed}"
+                aggregate_directory = batch_directory / "aggregate"
+                aggregate_directory.mkdir(parents=True)
+                self._write_json(
+                    batch_directory / "batch_config.json",
+                    {
+                        "tasks": ["hammer-v3"],
+                        "env_version": "v3",
+                        "reward_function_version": reward_version,
+                        "seed": seed,
+                        "steps_per_task": 1_000,
+                        "eval_every": 500,
+                        "det_eval_episodes": 0,
+                        "stoch_eval_episodes": 5,
+                        "max_episode_steps": 200,
+                    },
+                )
+                self._write_json(
+                    aggregate_directory / "baseline_curves.json",
+                    {
+                        "tasks": ["hammer-v3"],
+                        "evaluation_steps": [500, 1_000],
+                        "stochastic_success_curves": [[0.0, 1.0]],
+                        "stochastic_return_curves": [[0.0, 10.0]],
+                        "source_run_directories": [f"seed{seed}/hammer"],
+                    },
+                )
+                batch_directories.append(batch_directory)
+
+            with self.assertRaisesRegex(ValueError, "different protocols"):
+                aggregate_single_task_seed_batches(
+                    batch_directories=batch_directories,
+                    output_directory=root / "combined",
+                )
+
     def test_aggregate_writes_aligned_curves(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             batch_directory = Path(temporary_directory) / "batch"

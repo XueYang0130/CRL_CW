@@ -1,167 +1,387 @@
-# Research Log
+# Research Log and Handover
 
-## Current Research Goal
+For code-level orientation, read [repo_walkthrough.md](repo_walkthrough.md)
+after this document.
 
-The current project studies continual reinforcement learning on CW10 [2] under a unified Meta-World v3 protocol. The main goal is to develop a semantic local interference-aware continual RL method that can preserve useful old-task knowledge while maintaining strong new-task learning and forward transfer.
+## 1. Research Question
 
-At this stage, the research focus is:
+This project studies continual reinforcement learning on the CW10 Meta-World
+manipulation sequence. The working hypothesis is that transfer and forgetting
+are not uniform over a whole policy or a whole trajectory. Old and new tasks
+contain both cooperative behavioral structure and conflicting behavioral
+structure.
 
-1. establish strong and fair continual learning baselines under the current protocol,
-2. identify whether full trajectory preservation or selective semantic preservation is more effective,
-3. use the baseline comparison to guide the design of the next semantic method.
+The proposed direction is to preserve old knowledge selectively:
 
-Current protocol:
+1. collect successful old-policy rollouts;
+2. segment those rollouts into meaningful behavioral stages;
+3. apply Gaussian KL behavior cloning only to selected memory;
+4. use broad, task-specific, and possibly LLM-controlled memory channels so
+   retention is not reduced to a single fixed trajectory filter.
 
-- Meta-World v3
-- reward protocol: `cw10_v1`
-- `500k` steps per task
-- evaluation every `20k` steps
-- `5` stochastic evaluation episodes
+Full BC is not the intended contribution. It is the current empirical oracle.
+The research target is a structured semantic memory method that approaches or
+exceeds Full BC's retention and transfer while using less memory, producing a
+more interpretable mechanism, and exposing where old experience helps or
+interferes.
 
-## Core Hypothesis
+## 2. Current Protocol
 
-The central hypothesis of this project is that forgetting, forward transfer, and final performance degradation in continual reinforcement learning do not arise uniformly throughout the full training process of a new task. Instead, they are likely concentrated on specific behavioral substructures.
+All currently valid pilot results use:
 
-We assume that old and new tasks contain both:
+- benchmark: CW10 task order;
+- environment stack: native Meta-World v3 with Gymnasium;
+- observations: full v3 observations, no legacy 12-dimensional truncation;
+- reward protocol: `cw10_v1`;
+- `stick-pull-v3`: project-local `v1_compatible` reward wrapper;
+- stick-pull alignment: `stick=obs[4:7]`, `handle=obs[11:14]`,
+  `container=handle+[0.05,0,0]`;
+- installed Meta-World source: not modified;
+- horizon: 200 steps;
+- pilot budget: 500,000 environment steps per task;
+- evaluation interval: 20,000 steps;
+- evaluation: five stochastic episodes and zero deterministic episodes;
+- stochastic success: episode-level success if `info["success"]` is true at
+  any step.
 
-- cooperative structure, where previous knowledge can accelerate new-task learning,
-- conflicting structure, where previous knowledge interferes with adaptation and should instead be selectively stabilized.
+The current FT reference is the checkpoint-wise mean of complete pure
+single-task seed 1 and seed 2 runs:
+`outputs/single_task_baselines/cw10_v3_v1_500k_seeds1_2/aggregate/baseline_curves.json`.
+It should be rebuilt with the same aggregation script when more seeds finish.
 
-Under this view, old and new knowledge exist in a mixed cooperative-competitive relationship rather than a purely supportive or purely harmful one.
+## 3. CW10 Task Order
 
-This motivates a more selective alternative to coarse behavior-cloning-based preservation. Existing BC-style continual RL methods, such as ClonEx-SAC [1], preserve past knowledge at a relatively coarse granularity. While this can improve retention, it does not explicitly distinguish between transferable and interfering components of old behavior. As a result, it may preserve segments that are unnecessary on shared structure and overly constrain learning on conflicting structure.
+1. `hammer-v3`
+2. `push-wall-v3`
+3. `faucet-close-v3`
+4. `push-back-v3`
+5. `stick-pull-v3`
+6. `handle-press-side-v3`
+7. `push-v3`
+8. `shelf-place-v3`
+9. `window-close-v3`
+10. `peg-unplug-side-v3`
 
-Our main idea is therefore to separate cooperative and conflicting parts of cross-task experience. To do this, we plan to use an LLM in two roles:
+## 4. Semantic Representation
 
-1. semantic labeling:
-   annotate old-task rollouts into interpretable segments such as `approach`, `contact`, `alignment`, `manipulation`, or `stabilization`, using task descriptions and rollout summaries;
-2. adaptive gating:
-   select which segment types should be preserved through behavior cloning when a new task arrives.
+The active segmenter is `task_aware_v3`. It uses task-aware geometry, motion,
+grasp/contact, progress, success, and a post-success stabilization window.
 
-We further hypothesize that this selection should not be fixed. The old experience segments that are useful for stabilizing old knowledge may not be the same as the segments that are useful for helping new-task learning, and the relevant subset may change during the course of training. Therefore, segment preservation may need to be dynamic both across tasks and within a single task's training process.
+### General labels
 
-## Completed Baselines
+- `approach`
+- `contact_or_alignment`
+- `manipulation`
+- `finish_or_stabilize`
 
-### 1. Fine-tuning
+### Task-specific labels
 
-Fine-tuning is the naïve continual SAC baseline. A single continual learner is trained across the task sequence without any explicit mechanism for retention or transfer.
+The segmenter also emits 22 task-specific refinement labels:
 
-Role in this project:
+```text
+align_hammer_to_nail
+align_object_to_shelf
+align_tcp_for_push
+align_to_side_handle
+align_tool_to_handle
+approach_object
+complete_and_stabilize
+engage_faucet_handle
+engage_window_handle
+establish_contact
+establish_hammer_contact
+extract_peg_from_socket
+grasp_and_pull_peg
+grasp_or_engage_object
+lift_and_transport_object
+lift_and_transport_tool
+move_engaged_object
+press_handle_down
+push_object_toward_target
+rotate_faucet_closed
+slide_window_closed
+transport_hammer
+```
 
-- lower-bound continual baseline
-- reference point for catastrophic forgetting
+| Task | Possible task-specific labels |
+|---|---|
+| `hammer-v3` | `approach_object`, `establish_hammer_contact`, `grasp_or_engage_object`, `transport_hammer`, `align_hammer_to_nail`, `move_engaged_object`, `complete_and_stabilize` |
+| `push-wall-v3` | `approach_object`, `align_tcp_for_push`, `push_object_toward_target`, `complete_and_stabilize` |
+| `faucet-close-v3` | `approach_object`, `engage_faucet_handle`, `rotate_faucet_closed`, `complete_and_stabilize` |
+| `push-back-v3` | `approach_object`, `align_tcp_for_push`, `push_object_toward_target`, `complete_and_stabilize` |
+| `stick-pull-v3` | `approach_object`, `establish_contact`, `grasp_or_engage_object`, `lift_and_transport_tool`, `align_tool_to_handle`, `move_engaged_object`, `complete_and_stabilize` |
+| `handle-press-side-v3` | `approach_object`, `align_to_side_handle`, `press_handle_down`, `complete_and_stabilize` |
+| `push-v3` | `approach_object`, `align_tcp_for_push`, `push_object_toward_target`, `complete_and_stabilize` |
+| `shelf-place-v3` | `approach_object`, `establish_contact`, `grasp_or_engage_object`, `lift_and_transport_object`, `align_object_to_shelf`, `move_engaged_object`, `complete_and_stabilize` |
+| `window-close-v3` | `approach_object`, `engage_window_handle`, `slide_window_closed`, `complete_and_stabilize` |
+| `peg-unplug-side-v3` | `approach_object`, `establish_contact`, `grasp_or_engage_object`, `grasp_and_pull_peg`, `extract_peg_from_socket`, `move_engaged_object`, `complete_and_stabilize` |
 
-### 2. ClonEx-SAC Reimplementation
+## 5. Completed Pilot Runs
 
-This baseline is a PyTorch reimplementation of the core ClonEx-SAC mechanism. It uses:
+These are seed-0 pilot results preserved for reporting continuity. They are
+useful for direction setting, but they are not final statistical claims.
 
-- multi-head SAC
-- best-return exploration across previous heads
-- episodic actor distillation through KL-based cloning
+The FT columns below are pilot values. Older runs were computed before the
+current formal FT rule was locked to exclude task 0 and before the current
+multi-seed single-task aggregate was finalized. Keep them in the running log
+for progress reporting, then recompute the formal FT table after the new
+single-task aggregate and the new continual multi-seed runs finish.
 
-Role in this project:
+| Method | Average Performance | Average Forgetting | Forward Transfer | Area Forward Transfer | Average Return | Status |
+|---|---:|---:|---:|---:|---:|---|
+| Fine-tuning | 0.112 | 0.536 | -0.685 | -0.822 | 31,402.638 | valid lower-bound pilot |
+| ClonEx-SAC | 0.732 | 0.028 | -0.267 | -0.381 | 231,822.926 | valid literature-style baseline pilot |
+| Full BC | 0.904 | 0.048 | 0.239 | 0.210 | 255,417.002 | valid empirical oracle pilot |
+| Semantic Local BC v3 | 0.684 | 0.224 | pending recomputation | pending recomputation | 129,207.431 | valid static semantic pilot |
+| Semantic Hybrid LLM, three-channel | 0.820 | -0.032 | pending recomputation | pending recomputation | 186,332.000 | valid seed-0 proposed-method pilot; needs multi-seed confirmation |
 
-- primary continual RL baseline from the ClonEx line
-- reference method for transfer-oriented continual learning
+Current interpretation:
 
-### 3. Full-trajectory Behavior Cloning (`full_bc`)
+- Fine-tuning shows severe catastrophic forgetting.
+- ClonEx-SAC gives strong retention but did not dominate transfer in seed 0.
+- Full BC is the strongest completed seed-0 method and shows that successful
+  old-task trajectories contain useful retention and transfer information.
+- Static Semantic Local BC is better than fine-tuning but loses too much old
+  knowledge.
+- The three-channel LLM semantic method improves over static Semantic Local BC
+  in average performance and forgetting, but it has not yet matched Full BC.
+- `stick-pull-v3` remains high variance and should be analyzed across seeds
+  before making a strong method-level claim.
 
-This baseline uses the same general continual scaffold as the ClonEx-style setup, but stores successful full-trajectory reference states after each task and applies actor distillation on this full reference memory.
+## 6. Method Definitions
 
-Role in this project:
+### Fine-tuning
 
-- strong memory-preservation baseline
-- bridge between ClonEx-style distillation and future semantic selection
+Sequential SAC with no explicit retention, no semantic memory, and no BC.
 
-### 4. Semantic Local Behavior Cloning (`semantic_local_bc`)
+### ClonEx-SAC
 
-This method keeps the same continual SAC and actor-distillation scaffold as `full_bc`, but replaces full successful trajectory preservation with selective preservation of semantically labeled trajectory segments. In the current completed version, the preserved segments are fixed and include `contact_or_alignment` and `manipulation`. No LLM is involved yet in this version.
+Multi-head SAC with best-return historical-head exploration and Gaussian KL
+actor cloning. The reimplementation follows the central method components but
+uses PyTorch and the current Meta-World v3 protocol.
 
-Role in this project:
+### Full BC
 
-- first completed selective semantic memory baseline
-- proof-of-concept for local rather than full behavior preservation
+The same multi-head continual scaffold and Gaussian KL actor cloning loss, but
+memory is made from complete successful old-task rollout states. It does not
+semantic-filter those states. Full BC does not use old policies to collect new
+task data by itself; best-return exploration is part of the shared continual
+scaffold when enabled by the method configuration.
 
-### 4a. Semantic Local Behavior Cloning with Segment Fix (`semantic_local_bc_segfix`)
+### Semantic Local BC
 
-After the first `semantic_local_bc` run, we discovered that the formal segmentation logic for `window-close-v3` was flawed: the task was incorrectly mapped to a saturated progress state at reference-memory construction time, which led to missing semantic reference states for that task. We then repaired the task-aware semantic feature extraction and reran the same CW10 protocol with the same fixed segment set.
+Static semantic memory over selected general labels. The current valid version
+uses `task_aware_v3` and ClonEx-style Gaussian KL actor cloning, not MSE.
 
-Role in this project:
+### Semantic Hybrid BC
 
-- corrected semantic local BC baseline
-- cleaner reference point for subsequent semantic-memory ablations
+Three-channel semantic memory:
 
-### 5. Adaptive Semantic Behavior Cloning (`adaptive_semantic_bc`)
+- general channel: selected general labels and normalized weights;
+- background channel: unselected general labels, ratio `0.2G`;
+- task-specific channel: fine-grained labels from completed tasks, ratio
+  `0.2G`.
 
-This is the new task-adaptive scaffold built on top of `semantic_local_bc`. It keeps the same continual SAC and actor-distillation backbone, but replaces the fixed segment set with a manifest-driven pairwise selection mechanism. For each old-task to new-task transition, the method can now load a different semantic segment subset from a JSON manifest.
+With `llm_online`, GPT-5-mini controls only the general-channel label weights.
+Background and task-specific channels are fixed safeguards. Future-task
+trajectories and future-task task-specific memory are not available during
+training task `k`.
 
-Current status:
+### Gradient-aware BC
 
-- implementation completed,
-- unit tests passed,
-- continual smoke test passed,
-- current selection is manifest-driven placeholder logic rather than online LLM selection.
+Experimental diagnostic only. It projects and caps BC gradients relative to SAC
+gradients in `probe_stickpull_with_memory.py`. It is default-off and should not
+be treated as a completed baseline.
 
-## Main Results
+## 7. Forward Transfer Rule
 
-| Method | Average Performance | Average Forgetting | Forward Transfer | Area Forward Transfer | Average Return |
-|---|---:|---:|---:|---:|---:|
-| fine_tuning | 0.112 | 0.536 | -0.685 | -0.822 | 31402.638 |
-| clonex_sac | 0.732 | 0.028 | -0.267 | -0.381 | 231822.926 |
-| full_bc | 0.904 | 0.048 | 0.239 | 0.210 | 255417.002 |
-| semantic_local_bc | 0.516 | 0.300 | -0.078 | -0.176 | 69627.303 |
-| semantic_local_bc_segfix | 0.680 | 0.260 | -0.526 | -0.805 | 122173.466 |
+Formal aggregate forward transfer excludes task 0. The first task has no
+previously learned task, so it cannot measure forward transfer.
 
-## Segmentation Fix Impact
+The reporting plan is:
 
-The segmentation repair produced a meaningful improvement over the original `semantic_local_bc` run:
+1. run independent single-task SAC for multiple seeds;
+2. aggregate checkpoint-wise single-task curves into one mean curve per task;
+3. compare each continual seed against the same aggregated single-task curves;
+4. compute each continual seed's FT over tasks 1-9;
+5. report mean and standard deviation over continual seeds.
 
-| Metric | semantic_local_bc | semantic_local_bc_segfix |
-|---|---:|---:|
-| Average Performance | 0.516 | 0.680 |
-| Average Forgetting | 0.300 | 0.260 |
-| Forward Transfer | -0.078 | -0.526 |
-| Raw Forward Transfer | 0.028 | 0.077 |
-| Area Forward Transfer | -0.176 | -0.805 |
-| Average Return | 69627.303 | 122173.466 |
+Report raw FT, normalized FT, and area FT together. Normalized FT can be
+unstable when the single-task baseline curve is near 1.0, so raw and area
+curves should remain visible.
 
-The most important qualitative change is that `window-close-v3`, which previously contributed zero semantic reference states, now contributes nonzero selected semantic memory under the repaired task-aware segmentation logic.
+## 8. Immediate Formal Plan
 
-## Current Conclusion
+First run three seeds, then decide whether to extend to five seeds:
 
-The current results support the following conclusions.
+- seeds: 0, 1, 2 initially;
+- methods: `clonex_sac`, `full_bc`, `semantic_local_bc`,
+  `semantic_hybrid_bc`;
+- optional lower-bound: `fine_tuning`;
+- budget: 500,000 steps per task;
+- evaluation: every 20,000 steps, five stochastic episodes;
+- protocol: `v3` + `cw10_v1`;
+- metrics: AP, forgetting, raw FT, normalized FT, area FT, per-task tail-5
+  success, and stick-pull successful-seed count.
 
-1. Fine-tuning is clearly insufficient under the current protocol. Forgetting is severe and forward transfer is strongly negative.
+The single-task baseline is currently a two-seed aggregate. Add more seeds
+before the final statistical table because all formal FT claims depend on it.
 
-2. The ClonEx-SAC reimplementation remains a meaningful continual baseline. It substantially improves retention over fine-tuning, but its forward transfer advantage is not very strong under the current protocol.
+## 9. Current Single-Task Commands
 
-3. `full_bc` is currently the strongest completed baseline. It achieves the best overall performance and the best transfer behavior among the three completed runs.
+Seed 1:
 
-4. Full memory preservation is currently stronger than the present ClonEx-style episodic replay baseline under this protocol.
+```bash
+cd /Users/xueyang/crl_cw
 
-5. `semantic_local_bc` clearly outperforms naïve fine-tuning, which supports the basic feasibility of selective semantic preservation.
+caffeinate -dimsu env PYTHONPATH=src .venv/bin/python scripts/run.py \
+  --mode single-batch \
+  --method single_task_baseline \
+  --env-version v3 \
+  --reward-function-version cw10_v1 \
+  --num-tasks 10 \
+  --steps-per-task 500000 \
+  --eval-every 20000 \
+  --stoch-eval-episodes 5 \
+  --det-eval-episodes 0 \
+  --seed 1 \
+  --device cpu \
+  --output-dir outputs/single_task_baselines \
+  --run-name cw10_v3_v1_500k_seed1
+```
 
-6. However, the current fixed-segment version of `semantic_local_bc` does not yet match either `clonex_sac` or `full_bc` in final overall performance. Its forward transfer is less negative than `clonex_sac`, but its retention remains too weak on several later tasks.
+Seed 2:
 
-## Current Interpretation
+```bash
+cd /Users/xueyang/crl_cw
 
-The completed `semantic_local_bc` run suggests that selective semantic preservation is a meaningful direction, but fixed segment selection is too rigid.
+caffeinate -dimsu env PYTHONPATH=src .venv/bin/python scripts/run.py \
+  --mode single-batch \
+  --method single_task_baseline \
+  --env-version v3 \
+  --reward-function-version cw10_v1 \
+  --num-tasks 10 \
+  --steps-per-task 500000 \
+  --eval-every 20000 \
+  --stoch-eval-episodes 5 \
+  --det-eval-episodes 0 \
+  --seed 2 \
+  --device cpu \
+  --output-dir outputs/single_task_baselines \
+  --run-name cw10_v3_v1_500k_seed2
+```
 
-The main interpretation at this stage is:
+Aggregate command used after both runs completed:
 
-- selective preservation is viable,
-- fixed segment types can support strong learning on many tasks,
-- but the same fixed segment set is insufficient for robust retention across the full sequence,
-- especially for harder or more structurally distinct tasks.
+```bash
+PYTHONPATH=src .venv/bin/python scripts/aggregate_single_task_seeds.py \
+  --batch-directories \
+    outputs/single_task_baselines/cw10_v3_v1_500k_seed1 \
+    outputs/single_task_baselines/cw10_v3_v1_500k_seed2 \
+  --output-directory \
+    outputs/single_task_baselines/cw10_v3_v1_500k_seeds1_2/aggregate \
+  --tail-size 5
+```
 
-## Next Steps
+## 10. LLM Audit Requirements
 
-The next work items are:
+For LLM runs:
 
-1. run the first full CW10 experiment for `adaptive_semantic_bc`,
-2. replace placeholder manifest choices with LLM-based task-adaptive segment selection,
-3. explore stage-adaptive gating so that the preserved segment types can change during the course of new-task training,
-4. test whether adaptive semantic selection can close the gap to `full_bc` while keeping the efficiency and interpretability advantages of selective memory.
+- `.env` must contain `OPENAI_API_KEY`;
+- `OPENAI_MODEL` or `--llm-controller-model` should be `gpt-5-mini`;
+- prompt templates live in `prompts/llm_controller/`;
+- exact prompts are stored in `<run_dir>/controller_prompts/`;
+- decisions are stored in `<run_dir>/controller_decisions.json`;
+- invalid JSON, invalid segments, empty memory, API errors, or missing fields
+  fall back to the previous valid general-channel decision;
+- logging failure terminates the run because unauditable LLM runs should not be
+  used as evidence;
+- source-task assertions must remain enabled.
 
-[1]Wolczyk, Maciej, et al. "Disentangling transfer in continual reinforcement learning." Advances in Neural Information Processing Systems 35 (2022): 6304-6317.
-[2]Wolczyk, Maciej, et al. "Continual world: A robotic benchmark for continual reinforcement learning." Advances in Neural Information Processing Systems. 2021.
+## 11. Handover Checklist
+
+Before launching formal runs:
+
+- verify `.env` is present locally and not committed;
+- verify run names are unique;
+- keep `cw10_v1` and the stick-pull compatibility wrapper unchanged;
+- use the same single-task aggregate baseline for all continual seeds;
+- do not mix runs from different segmenter versions in one table;
+- keep experimental gradient-aware results separate from formal baseline
+  results.
+
+After every completed run:
+
+- preserve `config.json`, `evaluations.csv`, `task_summaries.csv`,
+  `summary.json`, checkpoints, and LLM audit files;
+- record reference-state counts and fallback rates for semantic methods;
+- inspect stick-pull separately before interpreting aggregate AP;
+- recompute the main table under the current FT rule.
+
+## Gradient-Conflict Evidence Collection
+
+Formal `full_bc` and `clonex_sac` runs now enable read-only gradient
+diagnostics by default. This does not project, rescale, or otherwise modify
+the gradients used for training. It samples one diagnostic point every 500 BC
+updates and performs source-task decomposition only at existing evaluation
+boundaries.
+
+Each run writes incrementally to `gradient_diagnostics/`:
+
+- `gradient_windows.csv`: SAC versus BC loss scale, shared-backbone and
+  full-actor gradient norms, cosine, conflict mass, gradient decomposition,
+  and pre-clip norm/clip scale;
+- `gradient_layers.csv`: the same geometry for each actor-backbone layer;
+- `gradient_task_pairs.csv`: source-old-task versus current-task conflict at
+  evaluation boundaries;
+- `summary.json`: run-wide means, extrema, conflict rate, and sample counts.
+
+Rows include task names, global and task-local steps, evaluation index, raw
+and weighted BC losses, and clipping settings. Memory source IDs are recovered
+from task one-hot vectors; training aborts if current or future task data is
+found in BC memory. A private diagnostic RNG and trajectory-equivalence test
+ensure that logging does not alter parameter updates.
+
+### Gradient-Handling Implementation Order
+
+1. **Asymmetric PCGrad**: project only the harmful BC component against SAC.
+   Test plasticity-priority and stability-priority variants first.
+2. **CAGrad**: optimize a shared direction with explicit conflict aversion;
+   this is the strongest candidate for improving the AP/forgetting/FT trade-off.
+3. **MGDA**: add a Pareto-balanced convex-combination baseline. It may be
+   conservative when gradients are noisy or badly scale-mismatched.
+4. **ConFIG or a comparable modern optimizer**: add only after the first three
+   establish that gradient geometry is the limiting factor.
+
+Expected behavior: plasticity-priority PCGrad should improve new-task learning
+and FT but may increase forgetting; stability-priority projection should do
+the reverse. MGDA should be stable but slower. CAGrad has the best chance of
+moving beyond Full BC's empirical Pareto point, but this requires multi-seed
+evidence rather than a single favorable run.
+
+### Implemented Gradient Methods
+
+`full_bc_norm_balanced` uses the Full BC memory, exploration, KL target, and
+training protocol without change. For shared-backbone gradients `g_sac` and
+`g_bc`, it computes `s = min(1, r*||g_sac||/(||g_bc||+eps))`, with `r=1` by
+default, then applies `s` to all BC actor gradients. The shared norm defines
+cross-task interaction, while the common scale prevents large old-head
+gradients from dominating global clipping.
+
+`full_bc_pcgrad` first checks the shared-backbone dot product. If negative, it
+replaces the shared BC component with
+`g_bc - <g_bc,g_sac>/||g_sac||^2 * g_sac`. Task-specific heads are never
+projected. It then applies the same norm-cap formula to the projected shared BC
+gradient. Comparing these two methods therefore isolates conflict-direction
+removal from gradient-scale control.
+
+Both preserve the final Full BC update `(g_sac + g_bc_applied)/2` and existing
+actor clipping. Diagnostics record the selected strategy, projection events,
+raw and applied BC norms/cosines, and the applied scale.
+
+## References
+
+1. Wolczyk, M., et al. "Disentangling Transfer in Continual Reinforcement
+   Learning." NeurIPS, 2022.
+2. Wolczyk, M., et al. "Continual World: A Robotic Benchmark for Continual
+   Reinforcement Learning." NeurIPS, 2021.

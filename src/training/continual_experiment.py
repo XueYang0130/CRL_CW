@@ -9,9 +9,14 @@ from typing import Any
 import numpy as np
 
 from agents import FullBehaviorCloningSACAgent, ReplayBuffer, SACAgent
+from agents.gradient_diagnostics import (
+    GRADIENT_LAYER_FIELDS,
+    GRADIENT_TASK_PAIR_FIELDS,
+    GRADIENT_WINDOW_FIELDS,
+)
 from envs import get_cw10_tasks, make_cw_env
 from evaluation import EvaluationConfig, SACEvaluator, summarize_continual_run
-from methods import get_method
+from methods import bc_gradient_strategy_for_method, get_method
 from training.sac_trainer import SACTrainer, SACTrainerConfig, seed_global_rngs
 from training.semantic_segments import (
     SEGMENT_ORDER,
@@ -23,6 +28,7 @@ from training.semantic_segments import (
 from training.segment_selection import (
     SegmentSelection,
     load_segment_selection_manifest,
+    normalize_segment_weights,
     select_task_specific_segments_for_task,
     select_segments_for_task_pair,
 )
@@ -32,7 +38,7 @@ from training.llm_controller import (
     call_openai_json_controller,
     read_api_key,
 )
-from utils import save_sac_checkpoint, write_csv, write_json
+from utils import append_csv_rows, save_sac_checkpoint, write_csv, write_json
 
 
 CW10_EVAL_FIELDS = [
@@ -81,6 +87,7 @@ CW10_TASK_SUMMARY_FIELDS = [
     "curriculum_transitions",
     "reference_success_episodes",
     "reference_states",
+    "success_replay_seen_states",
     "background_reference_states",
     "task_specific_reference_states",
     "semantic_segment_scheme",
@@ -88,9 +95,39 @@ CW10_TASK_SUMMARY_FIELDS = [
     "selected_segments",
     "task_specific_segments",
     "segment_priority",
+    "segment_weights",
     "segment_selection_reason",
     "segment_selection_source",
+    "success_replay_teacher",
+    "best_teacher_step",
+    "best_teacher_success",
+    "best_teacher_return",
 ]
+
+
+def clone_module_state(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    return {
+        name: value.detach().cpu().clone()
+        for name, value in module.state_dict().items()
+    }
+
+
+def add_relabelled_reference_memory(
+    *,
+    agent: FullBehaviorCloningSACAgent,
+    observations: np.ndarray,
+    teacher_actor_state: dict[str, torch.Tensor] | None,
+) -> None:
+    """Label states with one frozen teacher without changing the live actor."""
+    if observations.shape[0] == 0:
+        return
+    final_actor_state = clone_module_state(agent.actor)
+    try:
+        if teacher_actor_state is not None:
+            agent.actor.load_state_dict(teacher_actor_state, strict=True)
+        agent.add_reference_memory(observations=observations)
+    finally:
+        agent.actor.load_state_dict(final_actor_state, strict=True)
 
 STATIC_SEMANTIC_METHODS = {
     "semantic_local_bc",
@@ -98,7 +135,6 @@ STATIC_SEMANTIC_METHODS = {
     "general_task_specific_bc",
     "semantic_hybrid_bc",
 }
-
 
 def stage_aware_segment_groups(progress_ratio: float) -> tuple[str, ...]:
     if progress_ratio < 0.30:
@@ -139,7 +175,9 @@ def combine_reference_payloads(
 
 def segment_payload_counts(
     payload_store: dict[str, list[dict[str, np.ndarray]]],
+    labels: tuple[str, ...] | None = None,
 ) -> dict[str, int]:
+    labels = SEGMENT_ORDER if labels is None else labels
     return {
         segment: int(
             sum(
@@ -147,7 +185,7 @@ def segment_payload_counts(
                 for payload in payload_store.get(segment, [])
             )
         )
-        for segment in SEGMENT_ORDER
+        for segment in labels
     }
 
 
@@ -180,26 +218,87 @@ def _sample_payload_states(
     }
 
 
+def _resample_payload_states(
+    payloads: list[dict[str, np.ndarray]],
+    count: int,
+) -> dict[str, np.ndarray] | None:
+    observations, target_means, target_log_stds = combine_reference_payloads(payloads)
+    available = observations.shape[0]
+    if available == 0 or count <= 0:
+        return None
+    if count <= available:
+        indices = np.linspace(0, available - 1, num=count, dtype=int)
+    else:
+        indices = np.arange(count, dtype=int) % available
+    return {
+        "observations": observations[indices],
+        "target_means": target_means[indices],
+        "target_log_stds": target_log_stds[indices],
+    }
+
+
 def build_hybrid_memory_from_store(
     *,
     payload_store: dict[str, list[dict[str, np.ndarray]]],
     selected_segments: tuple[str, ...],
-    priority: tuple[str, ...],
+    segment_weights: dict[str, float] | None,
     background_ratio: float,
     task_specific_segments: tuple[str, ...] = (),
     task_specific_ratio: float = 0.0,
+    task_specific_payload_store: dict[str, list[dict[str, np.ndarray]]] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
-    if background_ratio < 0.0 or task_specific_ratio < 0.0:
-        raise ValueError("Hybrid memory ratios must be non-negative.")
+    if (
+        not np.isfinite(background_ratio)
+        or not np.isfinite(task_specific_ratio)
+        or background_ratio < 0.0
+        or task_specific_ratio < 0.0
+    ):
+        raise ValueError("Hybrid memory ratios must be finite and non-negative.")
     selected = set(selected_segments)
     task_specific = set(task_specific_segments).difference(selected)
-    priority_order = [segment for segment in priority if segment in selected]
-    priority_order.extend(segment for segment in selected_segments if segment not in priority_order)
-
     general_payloads: list[dict[str, np.ndarray]] = []
-    for rank, segment in enumerate(priority_order):
-        repetitions = max(1, len(priority_order) - rank)
-        general_payloads.extend(payload_store.get(segment, []) * repetitions)
+    available_counts = {
+        segment: int(combine_reference_payloads(payload_store.get(segment, []))[0].shape[0])
+        for segment in selected_segments
+    }
+    nonempty_segments = tuple(
+        segment for segment in selected_segments if available_counts[segment] > 0
+    )
+    if nonempty_segments:
+        requested_weights = None if segment_weights is None else {
+            segment: segment_weights[segment] for segment in nonempty_segments
+        }
+        probabilities = dict(
+            normalize_segment_weights(
+                requested_weights,
+                selected_segments=nonempty_segments,
+                field_name="segment_weights",
+            )
+        )
+        general_budget = sum(available_counts.values())
+        exact_counts = {
+            segment: general_budget * probabilities[segment]
+            for segment in nonempty_segments
+        }
+        allocated_counts = {
+            segment: int(np.floor(exact_counts[segment]))
+            for segment in nonempty_segments
+        }
+        remainder = general_budget - sum(allocated_counts.values())
+        remainder_order = sorted(
+            nonempty_segments,
+            key=lambda segment: exact_counts[segment] - allocated_counts[segment],
+            reverse=True,
+        )
+        for segment in remainder_order[:remainder]:
+            allocated_counts[segment] += 1
+        for segment in nonempty_segments:
+            weighted_payload = _resample_payload_states(
+                payload_store.get(segment, []),
+                allocated_counts[segment],
+            )
+            if weighted_payload is not None:
+                general_payloads.append(weighted_payload)
     general_count = sum(payload["observations"].shape[0] for payload in general_payloads)
 
     background_segments = set(SEGMENT_ORDER).difference(selected).difference(task_specific)
@@ -207,8 +306,21 @@ def build_hybrid_memory_from_store(
         [payload for segment in SEGMENT_ORDER if segment in background_segments for payload in payload_store[segment]],
         int(round(general_count * background_ratio)),
     )
+    if task_specific_payload_store is None:
+        task_specific_candidates = [
+            payload
+            for segment in SEGMENT_ORDER
+            if segment in task_specific
+            for payload in payload_store[segment]
+        ]
+    else:
+        task_specific_candidates = [
+            payload
+            for label_payloads in task_specific_payload_store.values()
+            for payload in label_payloads
+        ]
     task_specific_payload = _sample_payload_states(
-        [payload for segment in SEGMENT_ORDER if segment in task_specific for payload in payload_store[segment]],
+        task_specific_candidates,
         int(round(general_count * task_specific_ratio)),
     )
     payloads = list(general_payloads)
@@ -599,10 +711,17 @@ def collect_segmented_reference_observations(
             f"Unsupported semantic segments: {', '.join(invalid_segments)}. "
             f"Supported: {', '.join(SEGMENT_ORDER)}."
         )
-    if background_segment_ratio < 0.0:
-        raise ValueError("background_segment_ratio must be non-negative.")
-    if task_specific_segment_ratio < 0.0:
-        raise ValueError("task_specific_segment_ratio must be non-negative.")
+    if not np.isfinite(background_segment_ratio) or background_segment_ratio < 0.0:
+        raise ValueError(
+            "background_segment_ratio must be finite and non-negative."
+        )
+    if (
+        not np.isfinite(task_specific_segment_ratio)
+        or task_specific_segment_ratio < 0.0
+    ):
+        raise ValueError(
+            "task_specific_segment_ratio must be finite and non-negative."
+        )
     if post_success_steps < 0:
         raise ValueError("post_success_steps must be non-negative.")
     if task_specific_segments is None:
@@ -766,7 +885,11 @@ def collect_reference_payloads_by_segment(
     segment_scheme: str,
     post_success_steps: int,
     num_task_ids: int,
-) -> tuple[dict[str, dict[str, np.ndarray]], int]:
+) -> tuple[
+    dict[str, dict[str, np.ndarray]],
+    dict[str, dict[str, np.ndarray]],
+    int,
+]:
     env = make_cw_env(
         task_name,
         seed=seed,
@@ -779,6 +902,7 @@ def collect_reference_payloads_by_segment(
     segment_observations: dict[str, list[np.ndarray]] = {
         segment: [] for segment in SEGMENT_ORDER
     }
+    task_specific_observations: dict[str, list[np.ndarray]] = {}
     successful_episodes = 0
     attempts = 0
     if post_success_steps < 0:
@@ -787,7 +911,7 @@ def collect_reference_payloads_by_segment(
         while successful_episodes < episodes and attempts < max_attempts:
             reset_result = env.reset(seed=seed + attempts)
             observation = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-            episode_rows: list[tuple[np.ndarray, str]] = []
+            episode_rows: list[tuple[np.ndarray, str, str | None]] = []
             episode_success = False
             segmenter_v2 = TaskAwareSegmenter()
             segmenter_v3 = TaskAwareV3Segmenter()
@@ -812,13 +936,18 @@ def collect_reference_payloads_by_segment(
                 elif segment_scheme == "task_aware_v2":
                     label = segmenter_v2.label(features)
                 elif segment_scheme == "task_aware_v3":
-                    label = segmenter_v3.label(features).general
+                    semantic_label = segmenter_v3.label(features)
+                    label = semantic_label.general
+                    task_specific_label = semantic_label.task_specific
                 else:
                     raise ValueError(f"Unsupported semantic segment scheme: {segment_scheme}")
+                if segment_scheme != "task_aware_v3":
+                    task_specific_label = None
                 episode_rows.append(
                     (
                         np.asarray(observation, dtype=np.float32).copy(),
                         label,
+                        task_specific_label,
                     )
                 )
                 if success_detected:
@@ -844,8 +973,12 @@ def collect_reference_payloads_by_segment(
             if not episode_success:
                 continue
             successful_episodes += 1
-            for observation_row, label in episode_rows:
+            for observation_row, label, task_specific_label in episode_rows:
                 segment_observations[label].append(observation_row)
+                if task_specific_label is not None:
+                    task_specific_observations.setdefault(task_specific_label, []).append(
+                        observation_row
+                    )
     finally:
         env.close()
 
@@ -866,7 +999,16 @@ def collect_reference_payloads_by_segment(
                 "target_means": np.empty((0, agent.action_dim), dtype=np.float32),
                 "target_log_stds": np.empty((0, agent.action_dim), dtype=np.float32),
             }
-    return payloads, successful_episodes
+    task_specific_payloads: dict[str, dict[str, np.ndarray]] = {}
+    for label, observations_list in task_specific_observations.items():
+        observations = np.stack(observations_list).astype(np.float32)
+        target_means, target_log_stds = agent.compute_reference_targets(observations)
+        task_specific_payloads[label] = {
+            "observations": observations,
+            "target_means": target_means.detach().cpu().numpy().astype(np.float32),
+            "target_log_stds": target_log_stds.detach().cpu().numpy().astype(np.float32),
+        }
+    return payloads, task_specific_payloads, successful_episodes
 
 
 def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
@@ -907,6 +1049,34 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         total_tasks=len(tasks),
     )
     bounds_env.close()
+    if method.complete_reference_memory and not isinstance(
+        agent,
+        FullBehaviorCloningSACAgent,
+    ):
+        raise RuntimeError(
+            f"Method {args.method} declares complete reference memory but its "
+            "agent cannot store behavior-cloning reference observations."
+        )
+    if hasattr(agent, "bc_gradient_strategy"):
+        expected_strategy = bc_gradient_strategy_for_method(args.method)
+        actual_strategy = str(agent.bc_gradient_strategy)
+        if actual_strategy != expected_strategy:
+            raise RuntimeError(
+                f"Method-agent gradient strategy mismatch: method={args.method}, "
+                f"expected={expected_strategy}, actual={actual_strategy}."
+            )
+    if hasattr(agent, "gradient_diagnostics"):
+        actual_diagnostics = bool(agent.gradient_diagnostics.enabled)
+        if actual_diagnostics != bool(args.gradient_diagnostics):
+            raise RuntimeError(
+                "Method-agent gradient diagnostics mismatch: "
+                f"requested={bool(args.gradient_diagnostics)}, "
+                f"actual={actual_diagnostics}."
+            )
+    elif args.gradient_diagnostics:
+        raise RuntimeError(
+            f"Method {args.method} does not support actor gradient diagnostics."
+        )
     replay_buffer = ReplayBuffer(
         observation_dim=observation_dim,
         action_dim=action_dim,
@@ -937,6 +1107,41 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         else None
     )
     last_update_metrics: dict[str, float] | None = None
+
+    def flush_gradient_diagnostics(
+        *,
+        diagnostic_evaluation_index: int | None = None,
+        diagnostic_global_step: int | None = None,
+        diagnostic_active_task_step: int | None = None,
+    ) -> None:
+        if not hasattr(agent, "drain_gradient_diagnostics"):
+            return
+        diagnostic_rows = agent.drain_gradient_diagnostics()
+        for category, rows in diagnostic_rows.items():
+            for row in rows:
+                row["evaluation_index"] = diagnostic_evaluation_index
+                row["global_step"] = diagnostic_global_step
+                row["active_task_step"] = diagnostic_active_task_step
+                current_index = int(row["current_task_index"])
+                row["current_task_name"] = tasks[current_index]
+                if category == "task_pairs":
+                    source_index = int(row["source_task_index"])
+                    row["source_task_name"] = tasks[source_index]
+        append_csv_rows(
+            run_dir / "gradient_diagnostics" / "gradient_windows.csv",
+            GRADIENT_WINDOW_FIELDS,
+            diagnostic_rows["windows"],
+        )
+        append_csv_rows(
+            run_dir / "gradient_diagnostics" / "gradient_layers.csv",
+            GRADIENT_LAYER_FIELDS,
+            diagnostic_rows["layers"],
+        )
+        append_csv_rows(
+            run_dir / "gradient_diagnostics" / "gradient_task_pairs.csv",
+            GRADIENT_TASK_PAIR_FIELDS,
+            diagnostic_rows["task_pairs"],
+        )
     baseline_curves = load_baseline_curves(args.baseline_curves)
     validate_baseline_curves_for_run(
         baseline_curves,
@@ -953,16 +1158,40 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
     llm_online_memory_store: dict[str, list[dict[str, np.ndarray]]] = {
         segment: [] for segment in SEGMENT_ORDER
     }
+    llm_task_specific_memory_store: dict[str, list[dict[str, np.ndarray]]] = {}
+    llm_memory_source_task_indices: set[int] = set()
     llm_api_key = None
     if args.segment_selection_mode == "llm_online":
         llm_api_key = read_api_key(args.llm_controller_api_key_env)
 
     for task_index, task_name in enumerate(tasks):
+        leaked_sources = sorted(
+            source_index
+            for source_index in llm_memory_source_task_indices
+            if source_index >= task_index
+        )
+        if leaked_sources:
+            raise RuntimeError(
+                "LLM memory leakage detected before task start: "
+                f"current_task_index={task_index}, invalid_sources={leaked_sources}."
+            )
         segment_selection: SegmentSelection | None = None
         task_specific_selection: SegmentSelection | None = None
         active_reference_states = 0
         active_background_reference_states = 0
         active_task_specific_reference_states = 0
+        success_replay = (
+            SuccessfulStateReservoir(
+                capacity=args.episodic_memory_per_task,
+                observation_dim=observation_dim,
+                seed=args.seed + 600_000 + task_index,
+            )
+            if method.success_replay_teacher is not None
+            else None
+        )
+        best_teacher_state: dict[str, torch.Tensor] | None = None
+        best_teacher_score = (float("-inf"), float("-inf"))
+        best_teacher_step: int | None = None
         effective_exploration_strategy = normalize_exploration_strategy(
             args.exploration_strategy
         )
@@ -1015,9 +1244,17 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     fallback_segments=args.semantic_segments,
                 )
             else:
+                fixed_weights = dict(
+                    normalize_segment_weights(
+                        args.semantic_segment_weights,
+                        selected_segments=tuple(args.semantic_segments),
+                        field_name="semantic_segment_weights",
+                    )
+                )
                 segment_selection = SegmentSelection(
                     selected_segments=tuple(args.semantic_segments),
                     priority=tuple(args.semantic_segments),
+                    weights=tuple(fixed_weights.items()),
                     reason="Fixed semantic segment selection from CLI/config.",
                     selection_source="fixed",
                 )
@@ -1035,7 +1272,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             ) = build_hybrid_memory_from_store(
                 payload_store=static_semantic_memory_store,
                 selected_segments=segment_selection.selected_segments,
-                priority=segment_selection.priority,
+                segment_weights=dict(segment_selection.weights),
                 background_ratio=args.background_segment_ratio,
                 task_specific_segments=(
                     ()
@@ -1066,12 +1303,16 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             observations, target_means, target_log_stds, _, _ = build_hybrid_memory_from_store(
                 payload_store=llm_online_memory_store,
                 selected_segments=initial_selected_segments,
-                priority=initial_selected_segments,
+                segment_weights={
+                    segment: float((args.semantic_segment_weights or {}).get(segment, 1.0))
+                    for segment in initial_selected_segments
+                },
                 background_ratio=args.background_segment_ratio,
                 task_specific_segments=(
                     () if initial_task_specific is None else initial_task_specific.selected_segments
                 ),
                 task_specific_ratio=args.task_specific_segment_ratio,
+                task_specific_payload_store=llm_task_specific_memory_store,
             )
             if observations.shape[0] > 0:
                 agent.set_reference_memory_with_targets(
@@ -1217,13 +1458,26 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             else tuple()
         )
         current_llm_priority = current_llm_segments
+        current_llm_weights = dict(
+            normalize_segment_weights(
+                args.semantic_segment_weights,
+                selected_segments=current_llm_segments,
+                field_name="semantic_segment_weights",
+            )
+        ) if current_llm_segments else {}
 
         def evaluate(task_step: int, gradient_updates: int, update_metrics: dict[str, float] | None) -> None:
             nonlocal global_step, evaluation_index, last_update_metrics
             nonlocal curriculum_stage, curriculum_reference
             nonlocal curriculum_stage_best, curriculum_stage_evaluations
-            nonlocal current_stage_segments, current_llm_segments, current_llm_priority
+            nonlocal current_stage_segments, current_llm_segments, current_llm_priority, current_llm_weights
+            nonlocal best_teacher_state, best_teacher_score, best_teacher_step
             evaluation_index += 1
+            flush_gradient_diagnostics(
+                diagnostic_evaluation_index=evaluation_index,
+                diagnostic_global_step=task_index * args.steps_per_task + task_step,
+                diagnostic_active_task_step=task_step,
+            )
             last_update_metrics = update_metrics
             global_step = task_index * args.steps_per_task + task_step
             if args.method == "stage_aware_semantic_bc":
@@ -1272,6 +1526,15 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             active_row = rows[0]
             task_curve_success.append(float(active_row["stochastic_success_rate"]))
             task_curve_returns.append(float(active_row["stochastic_average_return"]))
+            if method.success_replay_teacher == "best":
+                candidate_score = (
+                    float(active_row["stochastic_success_rate"]),
+                    float(active_row["stochastic_average_return"]),
+                )
+                if candidate_score > best_teacher_score:
+                    best_teacher_score = candidate_score
+                    best_teacher_state = clone_module_state(agent.actor)
+                    best_teacher_step = task_step
             print(
                 f"[cw10] task={task_name} step={task_step:,}/{args.steps_per_task:,} "
                 f"success={active_row['stochastic_success_rate']:.3f} "
@@ -1284,7 +1547,21 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 and llm_api_key is not None
                 and len(task_curve_success) % args.llm_controller_update_every_evals == 0
             ):
+                leaked_sources = sorted(
+                    source_index
+                    for source_index in llm_memory_source_task_indices
+                    if source_index >= task_index
+                )
+                if leaked_sources:
+                    raise RuntimeError(
+                        "LLM memory leakage detected before controller call: "
+                        f"current_task_index={task_index}, invalid_sources={leaked_sources}."
+                    )
                 available_counts = segment_payload_counts(llm_online_memory_store)
+                available_task_specific_counts = segment_payload_counts(
+                    llm_task_specific_memory_store,
+                    labels=tuple(sorted(llm_task_specific_memory_store)),
+                )
                 prompt = build_llm_gate_prompt(
                     previous_task_name=tasks[task_index - 1],
                     current_task_name=task_name,
@@ -1294,6 +1571,10 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     recent_success_curve=task_curve_success[-5:],
                     recent_return_curve=task_curve_returns[-5:],
                     available_segment_counts=available_counts,
+                    available_task_specific_counts=available_task_specific_counts,
+                    current_selected_segments=current_llm_segments,
+                    current_segment_weights=current_llm_weights,
+                    prompt_dir=args.llm_controller_prompt_dir,
                 )
                 controller_log = {
                     "task_index": task_index,
@@ -1301,8 +1582,24 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     "task_step": task_step,
                     "evaluation_index_within_task": len(task_curve_success),
                     "available_segment_counts": available_counts,
+                    "available_task_specific_counts": available_task_specific_counts,
+                    "memory_source_task_indices": sorted(llm_memory_source_task_indices),
+                    "memory_source_task_names": [
+                        tasks[source_index]
+                        for source_index in sorted(llm_memory_source_task_indices)
+                    ],
+                    "background_segment_ratio": args.background_segment_ratio,
+                    "task_specific_segment_ratio": args.task_specific_segment_ratio,
                     "model": args.llm_controller_model,
                 }
+                prompt_dir = run_dir / "controller_prompts"
+                prompt_dir.mkdir(parents=True, exist_ok=True)
+                prompt_path = prompt_dir / (
+                    f"task_{task_index:02d}_eval_{len(task_curve_success):03d}.txt"
+                )
+                prompt_path.write_text(prompt, encoding="utf-8")
+                controller_log["prompt_path"] = str(prompt_path.relative_to(run_dir))
+                raw_response_text = ""
                 try:
                     controller_payload, raw_response_text = call_openai_json_controller(
                         api_key=llm_api_key,
@@ -1322,6 +1619,19 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     ):
                         raise ValueError("Controller priority must be a list of segment names.")
                     priority = tuple(priority_value)
+                    weights_value = controller_payload.get("weights")
+                    if not isinstance(weights_value, dict):
+                        raise ValueError("Controller weights must be an object.")
+                    weights = {segment: float(weights_value[segment]) for segment in selected_segments}
+                    weights = dict(
+                        normalize_segment_weights(
+                            weights,
+                            selected_segments=selected_segments,
+                            field_name="Controller weights",
+                        )
+                    )
+                    if not np.isclose(sum(weights.values()), 1.0, atol=1e-12):
+                        raise ValueError("Controller weights did not normalize to 1.0.")
                     invalid_selected = sorted(set(selected_segments).difference(SEGMENT_ORDER))
                     invalid_priority = sorted(set(priority).difference(selected_segments))
                     empty_selected = sorted(
@@ -1357,7 +1667,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     ) = build_hybrid_memory_from_store(
                         payload_store=llm_online_memory_store,
                         selected_segments=selected_segments,
-                        priority=priority,
+                        segment_weights=weights,
                         background_ratio=args.background_segment_ratio,
                         task_specific_segments=(
                             ()
@@ -1365,6 +1675,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                             else current_task_specific.selected_segments
                         ),
                         task_specific_ratio=args.task_specific_segment_ratio,
+                        task_specific_payload_store=llm_task_specific_memory_store,
                     )
                     if observations.shape[0] <= 0:
                         raise ValueError("Controller selection produced no reference states.")
@@ -1375,11 +1686,13 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     )
                     current_llm_segments = selected_segments
                     current_llm_priority = priority
+                    current_llm_weights = weights
                     controller_log.update(
                         {
                             "status": "applied",
                             "selected_segments": list(selected_segments),
                             "priority": list(priority),
+                            "weights": weights,
                             "background_reference_states": applied_background_states,
                             "task_specific_reference_states": applied_task_specific_states,
                             "reason": str(controller_payload.get("reason", "")),
@@ -1391,26 +1704,22 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                         {
                             "status": "fallback_keep_previous",
                             "selected_segments": list(current_llm_segments),
-                            "priority": list(current_llm_segments),
+                            "priority": list(current_llm_priority),
+                            "weights": current_llm_weights,
                             "reason": "controller_error",
                             "error": f"{type(error).__name__}: {error}",
-                            "raw_response_text": "",
+                            "raw_response_text": raw_response_text,
+                            "controller_error_detail": str(error),
                         }
                     )
                     print(
                         "[llm-controller] warning: keeping previous segments "
                         f"{list(current_llm_segments)} after {type(error).__name__}: {error}"
                     )
-                try:
-                    append_controller_log(
-                        run_dir / "controller_decisions.json",
-                        controller_log,
-                    )
-                except Exception as error:
-                    print(
-                        "[llm-controller] warning: decision log could not be written: "
-                        f"{type(error).__name__}: {error}"
-                    )
+                append_controller_log(
+                    run_dir / "controller_decisions.json",
+                    controller_log,
+                )
             if (
                 guide_head_index is not None
                 and task_step % args.jsrl_evaluation_interval == 0
@@ -1471,7 +1780,12 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                             }
                         )
 
-        training_summary = trainer.train(step_callback=evaluate)
+        training_summary = trainer.train(
+            step_callback=evaluate,
+            completed_episode_callback=(
+                None if success_replay is None else success_replay.add_episode
+            ),
+        )
         if curriculum_eval_env is not None:
             curriculum_eval_env.close()
         cumulative_gradient_updates += training_summary.gradient_updates
@@ -1485,15 +1799,55 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         background_reference_states = None
         task_specific_reference_states = None
         collected_segment_states = None
-        if args.method in {
-            "full_bc",
+        if success_replay is not None:
+            if not isinstance(agent, FullBehaviorCloningSACAgent):
+                raise RuntimeError(
+                    "Successful replay relabeling requires FullBehaviorCloningSACAgent."
+                )
+            reference_observations = success_replay.observations()
+            reference_success_episodes = success_replay.successful_episodes
+            reference_states = int(reference_observations.shape[0])
+            if reference_states > 0:
+                if (
+                    method.success_replay_teacher == "best"
+                    and best_teacher_state is None
+                ):
+                    raise RuntimeError(
+                        "Best-teacher relabeling has no validation snapshot."
+                    )
+                add_relabelled_reference_memory(
+                    agent=agent,
+                    observations=reference_observations,
+                    teacher_actor_state=(
+                        best_teacher_state
+                        if method.success_replay_teacher == "best"
+                        else None
+                    ),
+                )
+            if method.success_replay_teacher == "best":
+                if best_teacher_state is None or best_teacher_step is None:
+                    raise RuntimeError("Best-teacher snapshot is missing at task end.")
+                teacher_dir = run_dir / "teacher_snapshots"
+                teacher_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "actor_state_dict": best_teacher_state,
+                        "task_index": task_index,
+                        "task_name": task_name,
+                        "validation_step": best_teacher_step,
+                        "validation_success": best_teacher_score[0],
+                        "validation_return": best_teacher_score[1],
+                    },
+                    teacher_dir / f"task_{task_index}_best_actor.pt",
+                )
+        if method.complete_reference_memory or args.method in {
             "semantic_local_bc",
             "adaptive_semantic_bc",
             "general_task_specific_bc",
             "semantic_hybrid_bc",
             "stage_aware_semantic_bc",
         }:
-            if args.method == "full_bc":
+            if method.complete_reference_memory:
                 reference_observations, reference_success_episodes = collect_successful_reference_observations(
                     agent=agent,
                     task_name=task_name,
@@ -1511,7 +1865,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             elif args.method == "stage_aware_semantic_bc":
                 if not isinstance(agent, FullBehaviorCloningSACAgent):
                     raise RuntimeError("stage_aware_semantic_bc requires FullBehaviorCloningSACAgent.")
-                per_segment_payloads, reference_success_episodes = collect_reference_payloads_by_segment(
+                per_segment_payloads, _, reference_success_episodes = collect_reference_payloads_by_segment(
                     agent=agent,
                     task_name=task_name,
                     env_version=args.env_version,
@@ -1554,7 +1908,11 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             elif args.segment_selection_mode == "llm_online":
                 if not isinstance(agent, FullBehaviorCloningSACAgent):
                     raise RuntimeError("llm_online segment selection requires FullBehaviorCloningSACAgent.")
-                per_segment_payloads, reference_success_episodes = collect_reference_payloads_by_segment(
+                (
+                    per_segment_payloads,
+                    per_task_specific_payloads,
+                    reference_success_episodes,
+                ) = collect_reference_payloads_by_segment(
                     agent=agent,
                     task_name=task_name,
                     env_version=args.env_version,
@@ -1571,6 +1929,10 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 for segment, payload in per_segment_payloads.items():
                     if payload["observations"].shape[0] > 0:
                         llm_online_memory_store[segment].append(payload)
+                for label, payload in per_task_specific_payloads.items():
+                    if payload["observations"].shape[0] > 0:
+                        llm_task_specific_memory_store.setdefault(label, []).append(payload)
+                llm_memory_source_task_indices.add(task_index)
                 collected_segment_states = {
                     segment: int(payload["observations"].shape[0])
                     for segment, payload in per_segment_payloads.items()
@@ -1589,7 +1951,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 ) = build_hybrid_memory_from_store(
                     payload_store=llm_online_memory_store,
                     selected_segments=current_segments,
-                    priority=current_llm_priority,
+                    segment_weights=current_llm_weights,
                     background_ratio=args.background_segment_ratio,
                     task_specific_segments=(
                         ()
@@ -1597,6 +1959,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                         else current_task_specific.selected_segments
                     ),
                     task_specific_ratio=args.task_specific_segment_ratio,
+                    task_specific_payload_store=llm_task_specific_memory_store,
                 )
                 reference_states = int(reference_observations.shape[0])
                 if reference_observations.shape[0] > 0:
@@ -1610,6 +1973,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 segment_selection = SegmentSelection(
                     selected_segments=current_segments,
                     priority=current_llm_priority,
+                    weights=tuple(current_llm_weights.items()),
                     reason="Final LLM-online selection used for accumulated memory.",
                     selection_source="llm_online",
                 )
@@ -1618,7 +1982,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     raise RuntimeError(f"Unsupported semantic method: {args.method}")
                 if not isinstance(agent, FullBehaviorCloningSACAgent):
                     raise RuntimeError(f"{args.method} requires FullBehaviorCloningSACAgent.")
-                per_segment_payloads, reference_success_episodes = collect_reference_payloads_by_segment(
+                per_segment_payloads, _, reference_success_episodes = collect_reference_payloads_by_segment(
                     agent=agent,
                     task_name=task_name,
                     env_version=args.env_version,
@@ -1642,7 +2006,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 reference_states = active_reference_states
                 background_reference_states = active_background_reference_states
                 task_specific_reference_states = active_task_specific_reference_states
-            if args.method == "full_bc":
+            if method.complete_reference_memory:
                 reference_states = int(reference_observations.shape[0])
                 agent.add_reference_memory(observations=reference_observations)
         else:
@@ -1653,7 +2017,16 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             agent=agent,
             path=run_dir / "checkpoints" / f"task_{task_index}.pt",
             environment_step=(task_index + 1) * args.steps_per_task,
-            metadata={"task_name": task_name, "task_index": task_index},
+            metadata={
+                "task_name": task_name,
+                "task_index": task_index,
+                "method": args.method,
+                "bc_gradient_strategy": getattr(
+                    agent,
+                    "bc_gradient_strategy",
+                    None,
+                ),
+            },
         )
         task_summary_rows.append(
             {
@@ -1683,6 +2056,11 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 "curriculum_transitions": json.dumps(curriculum_transitions),
                 "reference_success_episodes": reference_success_episodes,
                 "reference_states": reference_states,
+                "success_replay_seen_states": (
+                    None
+                    if success_replay is None
+                    else success_replay.seen_successful_states
+                ),
                 "background_reference_states": background_reference_states,
                 "task_specific_reference_states": task_specific_reference_states,
                 "semantic_segment_scheme": (
@@ -1712,11 +2090,24 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     if segment_selection is None
                     else json.dumps(list(segment_selection.priority))
                 ),
+                "segment_weights": (
+                    None
+                    if segment_selection is None
+                    else json.dumps(dict(segment_selection.weights), sort_keys=True)
+                ),
                 "segment_selection_reason": (
                     None if segment_selection is None else segment_selection.reason
                 ),
                 "segment_selection_source": (
                     None if segment_selection is None else segment_selection.selection_source
+                ),
+                "success_replay_teacher": method.success_replay_teacher,
+                "best_teacher_step": best_teacher_step,
+                "best_teacher_success": (
+                    None if best_teacher_step is None else best_teacher_score[0]
+                ),
+                "best_teacher_return": (
+                    None if best_teacher_step is None else best_teacher_score[1]
                 ),
             }
         )
@@ -1747,6 +2138,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         )
         all_eval_rows.extend(final_rows)
 
+    flush_gradient_diagnostics()
     write_csv(run_dir / "evaluations.csv", CW10_EVAL_FIELDS, all_eval_rows)
     write_csv(run_dir / "task_summaries.csv", CW10_TASK_SUMMARY_FIELDS, task_summary_rows)
 
@@ -1769,6 +2161,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
     )
     average_return = sum(sum(row) / len(row) for row in final_return_rows) / len(final_return_rows)
     summary_payload = {
+        "method": args.method,
         "tasks": tasks,
         "average_performance": metrics["average_performance"],
         "average_return": average_return,
@@ -1798,6 +2191,13 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         "run_directory": str(run_dir),
         "elapsed_seconds": time.time() - started_at,
     }
+    if hasattr(agent, "gradient_diagnostics_summary"):
+        gradient_summary = agent.gradient_diagnostics_summary()
+        write_json(
+            run_dir / "gradient_diagnostics" / "summary.json",
+            gradient_summary,
+        )
+        summary_payload["gradient_diagnostics"] = gradient_summary
     write_json(run_dir / "summary.json", summary_payload)
     return {
         "summary": summary_payload,
