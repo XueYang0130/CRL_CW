@@ -541,8 +541,8 @@ class FullBehaviorCloningSACAgent(SACAgent):
         second_log_std: torch.Tensor,
     ) -> torch.Tensor:
         epsilon = 1e-6
-        first_variance = (first_log_std.exp() + epsilon).square()
-        second_variance = (second_log_std.exp() + epsilon).square()
+        first_variance = first_log_std.exp().square() + epsilon
+        second_variance = second_log_std.exp().square() + epsilon
         return (
             second_log_std
             - first_log_std
@@ -555,9 +555,5 @@ class FullBehaviorCloningSACAgent(SACAgent):
         self,
         observations: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        raw_means, log_stds = self.actor.distribution_parameters(observations)
-        means = (
-            torch.tanh(raw_means) * self.actor.action_scale
-            + self.actor.action_bias
-        )
-        return means, log_stds
+        # Return pre-tanh raw means so KL is computed in the same space as log_stds.
+        return self.actor.distribution_parameters(observations)

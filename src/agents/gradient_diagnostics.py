@@ -75,10 +75,10 @@ def _gradient_metrics(
     bc_norm = bc_norm_sq.sqrt()
     combined_norm = combined_norm_sq.sqrt()
     cosine = dot / (sac_norm * bc_norm + epsilon)
-    signed_parallel = dot / (sac_norm + epsilon)
+    signed_parallel = dot / torch.clamp(sac_norm, min=epsilon)
     parallel_norm = signed_parallel.abs()
     orthogonal_sq = torch.clamp(
-        bc_norm_sq - signed_parallel.square(),
+        bc_norm_sq - dot.square() / torch.clamp(sac_norm_sq, min=epsilon),
         min=0.0,
     )
     conflict_mass = torch.relu(-dot) / (sac_norm * bc_norm + epsilon)

@@ -19,9 +19,13 @@ venv/
 # IDE and OS
 .vscode/
 .DS_Store
+MUJOCO_LOG.TXT
 
 # Experiment tracking
 wandb/
+logs/
+debug_log_*.txt
+logs_screen_*.txt
 
 # Local secrets
 .env

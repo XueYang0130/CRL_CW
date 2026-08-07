@@ -4,7 +4,7 @@ cluster:
   host: 140.203.17.131
   user: xue
   remote_dir: ~/crl_cw
-  python_exec: /home/xue/anaconda3/envs/rl_agent/bin/python
+  python_exec: /home/xue/anaconda3/envs/crl_env/bin/python
   
   rsync_excludes:
     - ".git"

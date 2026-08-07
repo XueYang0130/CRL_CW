@@ -130,9 +130,5 @@ class LocalBehaviorCloningSACAgent(SACAgent):
         self,
         observations: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        raw_means, log_stds = self.actor.distribution_parameters(observations)
-        means = (
-            torch.tanh(raw_means) * self.actor.action_scale
-            + self.actor.action_bias
-        )
-        return means, log_stds
+        # Return pre-tanh raw means so KL is computed in the same space as log_stds.
+        return self.actor.distribution_parameters(observations)

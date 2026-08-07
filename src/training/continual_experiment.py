@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 from agents import FullBehaviorCloningSACAgent, ReplayBuffer, SACAgent
 from agents.gradient_diagnostics import (
@@ -38,6 +39,7 @@ from training.llm_controller import (
     call_openai_json_controller,
     read_api_key,
 )
+from training.success_replay import SuccessfulStateReservoir
 from utils import append_csv_rows, save_sac_checkpoint, write_csv, write_json
 
 
@@ -153,10 +155,12 @@ def combine_reference_payloads(
         if payload["observations"].shape[0] > 0
     ]
     if not non_empty_payloads:
+        obs_dim = payloads[0]["observations"].shape[1] if payloads else 1
+        act_dim = payloads[0]["target_means"].shape[1] if payloads else 1
         return (
-            np.empty((0, 0), dtype=np.float32),
-            np.empty((0, 0), dtype=np.float32),
-            np.empty((0, 0), dtype=np.float32),
+            np.empty((0, obs_dim), dtype=np.float32),
+            np.empty((0, act_dim), dtype=np.float32),
+            np.empty((0, act_dim), dtype=np.float32),
         )
     observations = np.concatenate(
         [payload["observations"] for payload in non_empty_payloads],
