@@ -22,6 +22,7 @@ class FullBehaviorCloningSACAgent(SACAgent):
         bc_combination_strategy: str = "average",
         bc_adaptive_target_ratio: float = 0.2,
         bc_adaptive_conflict_ratio: float = 0.05,
+        bc_cagrad_alpha: float = 0.5,
         gradient_diagnostics: bool = False,
         gradient_diagnostics_interval: int = 500,
         gradient_diagnostics_source_batch_size: int = 128,
@@ -56,6 +57,7 @@ class FullBehaviorCloningSACAgent(SACAgent):
             "average",
             "additive",
             "adaptive_additive",
+            "cagrad",
         }
         if bc_combination_strategy not in valid_combination_strategies:
             raise ValueError(
@@ -77,6 +79,8 @@ class FullBehaviorCloningSACAgent(SACAgent):
                 "bc_adaptive_conflict_ratio cannot exceed "
                 "bc_adaptive_target_ratio."
             )
+        if not math.isfinite(bc_cagrad_alpha) or not 0.0 <= bc_cagrad_alpha < 1.0:
+            raise ValueError("bc_cagrad_alpha must be finite and in [0, 1).")
 
         self.episodic_batch_size = int(episodic_batch_size)
         self.actor_cloning_coefficient = float(actor_cloning_coefficient)
@@ -85,6 +89,8 @@ class FullBehaviorCloningSACAgent(SACAgent):
         self.bc_combination_strategy = bc_combination_strategy
         self.bc_adaptive_target_ratio = float(bc_adaptive_target_ratio)
         self.bc_adaptive_conflict_ratio = float(bc_adaptive_conflict_ratio)
+        self.bc_cagrad_alpha = float(bc_cagrad_alpha)
+        self.bc_progress_multiplier = 1.0
         self.gradient_aware_bc = False
         self.gradient_aware_max_norm_ratio = 1.0
         self.last_bc_gradient_cosine = float("nan")
@@ -104,6 +110,11 @@ class FullBehaviorCloningSACAgent(SACAgent):
             gradient_clip_norm=self.gradient_clip_norm,
             seed=gradient_diagnostics_seed,
         )
+
+    def set_bc_progress_multiplier(self, multiplier: float) -> None:
+        if not math.isfinite(multiplier) or not 0.0 <= multiplier <= 1.0:
+            raise ValueError("BC progress multiplier must be finite and in [0, 1].")
+        self.bc_progress_multiplier = float(multiplier)
 
     def configure_gradient_aware_bc(
         self,
@@ -322,23 +333,30 @@ class FullBehaviorCloningSACAgent(SACAgent):
         conflict: bool,
     ) -> tuple[tuple[torch.Tensor, ...], float]:
         if self.bc_combination_strategy == "average":
+            multiplier = self.bc_progress_multiplier
             return tuple(
-                (sac_gradient + cloning_gradient) / 2.0
+                (sac_gradient + multiplier * cloning_gradient) / (1.0 + multiplier)
                 for sac_gradient, cloning_gradient in zip(
                     sac_gradients,
                     applied_cloning_gradients,
                     strict=True,
                 )
-            ), 1.0
+            ), multiplier
         if self.bc_combination_strategy == "additive":
+            multiplier = self.bc_progress_multiplier
             return tuple(
-                sac_gradient + cloning_gradient
+                sac_gradient + multiplier * cloning_gradient
                 for sac_gradient, cloning_gradient in zip(
                     sac_gradients,
                     applied_cloning_gradients,
                     strict=True,
                 )
-            ), 1.0
+            ), multiplier
+        if self.bc_combination_strategy == "cagrad":
+            return self._combine_actor_gradients_cagrad(
+                sac_gradients=sac_gradients,
+                bc_gradients=applied_cloning_gradients,
+            )
         if self.bc_combination_strategy != "adaptive_additive":
             raise RuntimeError(
                 "Unsupported BC combination strategy reached runtime: "
@@ -358,7 +376,7 @@ class FullBehaviorCloningSACAgent(SACAgent):
             self.bc_adaptive_conflict_ratio
             if conflict
             else self.bc_adaptive_target_ratio
-        )
+        ) * self.bc_progress_multiplier
         scale = torch.clamp(
             target_ratio * sac_norm / (bc_norm + epsilon),
             min=0.0,
@@ -373,6 +391,101 @@ class FullBehaviorCloningSACAgent(SACAgent):
                 strict=True,
             )
         ), scale_value
+
+    def _combine_actor_gradients_cagrad(
+        self,
+        *,
+        sac_gradients: tuple[torch.Tensor, ...],
+        bc_gradients: tuple[torch.Tensor, ...],
+    ) -> tuple[tuple[torch.Tensor, ...], float]:
+        """Combine SAC and BC with the two-objective CAGrad direction."""
+        progress = self.bc_progress_multiplier
+        if progress == 0.0:
+            return sac_gradients, 0.0
+
+        shared_indices = self.gradient_diagnostics.shared_indices
+        scaled_bc = tuple(progress * gradient for gradient in bc_gradients)
+        mean_gradient = tuple(
+            0.5 * (sac + bc)
+            for sac, bc in zip(sac_gradients, scaled_bc, strict=True)
+        )
+        mean_norm = sum(
+            mean_gradient[index].square().sum() for index in shared_indices
+        ).sqrt()
+        epsilon = 1e-12
+        if float(mean_norm.detach().item()) <= epsilon or self.bc_cagrad_alpha == 0.0:
+            return mean_gradient, 0.5
+
+        sac_norm_sq = sum(
+            sac_gradients[index].square().sum() for index in shared_indices
+        )
+        bc_norm_sq = sum(
+            scaled_bc[index].square().sum() for index in shared_indices
+        )
+        sac_bc_dot = sum(
+            (sac_gradients[index] * scaled_bc[index]).sum()
+            for index in shared_indices
+        )
+        sac_norm_sq_value = float(sac_norm_sq.detach().item())
+        bc_norm_sq_value = float(bc_norm_sq.detach().item())
+        sac_bc_dot_value = float(sac_bc_dot.detach().item())
+
+        # With two objectives, the simplex optimization is one-dimensional.
+        # Evaluate it from the 2x2 Gram matrix rather than revisiting the model.
+        def objective(weight: float) -> float:
+            bc_weight = 1.0 - weight
+            candidate_norm_sq = max(
+                0.0,
+                weight * weight * sac_norm_sq_value
+                + bc_weight * bc_weight * bc_norm_sq_value
+                + 2.0 * weight * bc_weight * sac_bc_dot_value,
+            )
+            alignment = 0.5 * (
+                weight * (sac_norm_sq_value + sac_bc_dot_value)
+                + bc_weight * (sac_bc_dot_value + bc_norm_sq_value)
+            )
+            return (
+                alignment
+                + self.bc_cagrad_alpha
+                * float(mean_norm.detach().item())
+                * math.sqrt(candidate_norm_sq)
+            )
+
+        left, right = 0.0, 1.0
+        inverse_phi = (math.sqrt(5.0) - 1.0) / 2.0
+        x1 = right - inverse_phi * (right - left)
+        x2 = left + inverse_phi * (right - left)
+        f1, f2 = objective(x1), objective(x2)
+        for _ in range(48):
+            if f1 <= f2:
+                right, x2, f2 = x2, x1, f1
+                x1 = right - inverse_phi * (right - left)
+                f1 = objective(x1)
+            else:
+                left, x1, f1 = x1, x2, f2
+                x2 = left + inverse_phi * (right - left)
+                f2 = objective(x2)
+        sac_weight = 0.5 * (left + right)
+        weighted_gradient = tuple(
+            sac_weight * sac + (1.0 - sac_weight) * bc
+            for sac, bc in zip(sac_gradients, scaled_bc, strict=True)
+        )
+        weighted_shared_norm = sum(
+            weighted_gradient[index].square().sum() for index in shared_indices
+        ).sqrt()
+        cagrad_scale = (
+            self.bc_cagrad_alpha * mean_norm / (weighted_shared_norm + epsilon)
+        )
+        normalizer = 1.0 + self.bc_cagrad_alpha**2
+        combined = tuple(
+            (mean + cagrad_scale * weighted) / normalizer
+            for mean, weighted in zip(
+                mean_gradient,
+                weighted_gradient,
+                strict=True,
+            )
+        )
+        return combined, float(sac_weight)
 
     def _apply_bc_gradient_strategy(
         self,

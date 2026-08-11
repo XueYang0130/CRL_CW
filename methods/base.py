@@ -32,13 +32,26 @@ class MethodSpec:
     reference_exploration: bool = False
     complete_reference_memory: bool = False
     success_replay_teacher: str | None = None
+    broader_replay_selector: str | None = None
+    broader_replay_ratio: float = 0.0
     guide_mode: str = "none"
+    llm_prior_initialization: bool = False
 
     def __post_init__(self) -> None:
         if self.success_replay_teacher not in {None, "final", "best"}:
             raise ValueError(
                 "success_replay_teacher must be None, 'final', or 'best'."
             )
+        if self.broader_replay_selector not in {None, "random", "llm"}:
+            raise ValueError(
+                "broader_replay_selector must be None, 'random', or 'llm'."
+            )
+        if not 0.0 <= self.broader_replay_ratio < 1.0:
+            raise ValueError("broader_replay_ratio must be in [0, 1).")
+        if self.broader_replay_selector is None and self.broader_replay_ratio != 0.0:
+            raise ValueError("broader_replay_ratio requires a broader replay selector.")
+        if self.broader_replay_selector is not None and self.success_replay_teacher is None:
+            raise ValueError("Broader replay requires a success-replay teacher.")
 
     def build_agent(
         self,

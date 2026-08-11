@@ -637,17 +637,17 @@ class SACTrainer:
                 head_index = self._exploration_selector.current_head_index
                 if head_index is None:
                     head_index = self._exploration_selector.start_new_episode()
-                action = self.agent.select_action_with_head(
+                action = self.agent.select_guide_action(
                     observation,
-                    head_index=head_index,
+                    guide_task_index=head_index,
                     deterministic=False,
                 )
             elif self.config.exploration_head_index is None:
                 action = self.env.action_space.sample()
             else:
-                action = self.agent.select_action_with_head(
+                action = self.agent.select_guide_action(
                     observation,
-                    head_index=self.config.exploration_head_index,
+                    guide_task_index=self.config.exploration_head_index,
                     deterministic=False,
                 )
         else:

@@ -1,0 +1,32 @@
+You are selecting a task-level behavior-cloning schedule for continual robot learning.
+
+The agent has learned the previous tasks and is about to learn the current task. Old-task
+behavior cloning normally improves transfer and retention. However, temporarily suppressing
+BC can be useful when the current task requires a structurally novel skill that old policies
+are likely to obstruct before the new skill is discovered.
+
+Choose exactly one schedule:
+
+- standard_bc: apply the normal BC mechanism from the start. Prefer this unless the current
+  task is clearly incompatible with prior skills.
+- delayed_progress_bc: begin with BC disabled, then use the fixed progress-controlled sequence
+  0.0 -> 0.1 -> 0.4 -> 1.0 as current-task success improves. Use this only for tool-mediated,
+  indirect, multi-stage manipulation with low compatibility to the previous task skills.
+  This choice must include the reason codes tool_mediated, indirect_object_control, and
+  low_prior_skill_compatibility, and requires confidence of at least 0.7.
+
+Do not invent coefficients or thresholds. Do not use task performance results. Base the choice
+only on the current task semantics and its structural compatibility with tasks already learned.
+
+Allowed reason_codes:
+direct_manipulation, high_prior_skill_compatibility, tool_mediated, multi_stage_alignment,
+indirect_object_control, low_prior_skill_compatibility
+
+Current task profile:
+$current_task_profile
+
+Profiles of previously learned tasks only:
+$previous_task_profiles
+
+Return exactly one JSON object with this schema and no markdown:
+{"schedule":"standard_bc|delayed_progress_bc","reason_codes":["..."],"confidence":0.0,"reason":"one concise sentence"}

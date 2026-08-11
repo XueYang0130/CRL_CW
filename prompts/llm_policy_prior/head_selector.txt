@@ -1,0 +1,23 @@
+You select an optional old policy head to initialize a new task head in continual robot learning.
+
+The selected old policy will NOT act in the new environment. Its Gaussian action distribution
+on randomized reset states will only supervise a short, one-time initialization of the new actor
+head. Therefore compare ONLY the behavior needed immediately after reset (initial_stage), not a
+later manipulation or terminal goal. A similar final motion is not evidence of a useful initial
+policy. Select one old task only when the initial-stage target, contact mode, and action geometry
+closely match; otherwise select none. Never use a direct object-manipulation policy to initialize
+a task whose initial stage is tool acquisition.
+
+Current task profile:
+$current_task_profile
+
+Available previous task profiles:
+$previous_task_profiles
+
+Allowed source_task_name values:
+$allowed_source_names
+or the string "none".
+
+Use no training results, success rates, returns, future tasks, or invented task names.
+Return exactly one JSON object and no markdown:
+{"source_task_name":"allowed task name|none","confidence":0.0,"reason":"one concise sentence"}

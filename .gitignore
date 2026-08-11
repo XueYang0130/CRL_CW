@@ -19,6 +19,7 @@ venv/
 # IDE and OS
 .vscode/
 .DS_Store
+.mplconfig/
 MUJOCO_LOG.TXT
 
 # Experiment tracking

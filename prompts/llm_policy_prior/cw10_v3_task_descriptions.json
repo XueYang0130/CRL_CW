@@ -1,0 +1,15 @@
+{
+  "source": "Project task profiles for Meta-World v3 CW10 under the cw10_v1 reward protocol.",
+  "tasks": {
+    "hammer-v3": {"official_description": "Hammer a screw into a wall with a hammer.", "initial_stage": "reach, align with, and grasp a free tool", "interaction_structure": "tool acquisition followed by aligned impact"},
+    "push-wall-v3": {"official_description": "Push a puck to a goal while bypassing a wall.", "initial_stage": "reach the puck and establish direct planar pushing contact", "interaction_structure": "obstacle-aware direct planar pushing"},
+    "faucet-close-v3": {"official_description": "Rotate a faucet clockwise to turn it off.", "initial_stage": "reach and align with a fixed articulated handle", "interaction_structure": "direct handle engagement and constrained rotation"},
+    "push-back-v3": {"official_description": "Pull a puck to a goal.", "initial_stage": "move behind the puck and establish direct contact", "interaction_structure": "rear-side alignment and direct sustained planar motion"},
+    "stick-pull-v3": {"official_description": "Grasp a stick and use it to pull a box.", "initial_stage": "reach, align with, and grasp a free tool", "interaction_structure": "tool grasp, alignment, engagement, and indirect object control", "reward_protocol_note": "v3 environment with project v1-compatible observation alignment"},
+    "handle-press-side-v3": {"official_description": "Press a handle down sideways.", "initial_stage": "reach and side-align with a fixed articulated handle", "interaction_structure": "direct side alignment and pressing"},
+    "push-v3": {"official_description": "Push a puck to a goal.", "initial_stage": "reach the puck and establish direct planar pushing contact", "interaction_structure": "direct sustained planar pushing"},
+    "shelf-place-v3": {"official_description": "Pick up a puck and place it on a shelf.", "initial_stage": "reach, align with, and grasp a free object", "interaction_structure": "direct grasp, lift, transport, alignment, and release"},
+    "window-close-v3": {"official_description": "Push and close a window.", "initial_stage": "reach and align with a fixed sliding handle", "interaction_structure": "direct handle engagement and constrained sliding"},
+    "peg-unplug-side-v3": {"official_description": "Unplug a peg sideways.", "initial_stage": "reach, side-align with, and grasp a constrained object", "interaction_structure": "direct grasp and constrained lateral extraction"}
+  }
+}

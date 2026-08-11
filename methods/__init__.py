@@ -14,6 +14,25 @@ from methods.stage_aware_semantic_bc import METHOD as STAGE_AWARE_SEMANTIC_BC
 from methods.success_replay_best_adaptive_pcgrad import (
     METHOD as SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
 )
+from methods.success_replay_best_random_broader_adaptive_pcgrad import (
+    METHOD as SUCCESS_REPLAY_BEST_RANDOM_BROADER_ADAPTIVE_PCGRAD,
+)
+from methods.success_replay_best_llm_broader_adaptive_pcgrad import (
+    METHOD as SUCCESS_REPLAY_BEST_LLM_BROADER_ADAPTIVE_PCGRAD,
+)
+from methods.success_replay_best_cagrad import METHOD as SUCCESS_REPLAY_BEST_CAGRAD
+from methods.success_replay_best_conflict_lora import (
+    METHOD as SUCCESS_REPLAY_BEST_CONFLICT_LORA,
+)
+from methods.success_replay_best_progress_pcgrad import (
+    METHOD as SUCCESS_REPLAY_BEST_PROGRESS_PCGRAD,
+)
+from methods.success_replay_best_llm_schedule_pcgrad import (
+    METHOD as SUCCESS_REPLAY_BEST_LLM_SCHEDULE_PCGRAD,
+)
+from methods.success_replay_best_llm_prior_pcgrad import (
+    METHOD as SUCCESS_REPLAY_BEST_LLM_PRIOR_PCGRAD,
+)
 from methods.success_replay_best import METHOD as SUCCESS_REPLAY_BEST
 from methods.success_replay_best_pcgrad import METHOD as SUCCESS_REPLAY_BEST_PCGRAD
 from methods.success_replay_final import METHOD as SUCCESS_REPLAY_FINAL
@@ -43,6 +62,13 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
         SUCCESS_REPLAY_BEST,
         SUCCESS_REPLAY_BEST_PCGRAD,
         SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
+        SUCCESS_REPLAY_BEST_RANDOM_BROADER_ADAPTIVE_PCGRAD,
+        SUCCESS_REPLAY_BEST_LLM_BROADER_ADAPTIVE_PCGRAD,
+        SUCCESS_REPLAY_BEST_CAGRAD,
+        SUCCESS_REPLAY_BEST_CONFLICT_LORA,
+        SUCCESS_REPLAY_BEST_PROGRESS_PCGRAD,
+        SUCCESS_REPLAY_BEST_LLM_SCHEDULE_PCGRAD,
+        SUCCESS_REPLAY_BEST_LLM_PRIOR_PCGRAD,
         ADAPTIVE_SEMANTIC_BC,
         GENERAL_TASK_SPECIFIC_BC,
         JSRL_CONTINUAL,
@@ -59,6 +85,24 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
     "success_replay_best": "standard",
     "success_replay_best_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_adaptive_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_random_broader_adaptive_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_llm_broader_adaptive_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_cagrad": "standard",
+    "success_replay_best_conflict_lora": "pcgrad_sac_priority",
+    "success_replay_best_progress_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_llm_schedule_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_llm_prior_pcgrad": "pcgrad_sac_priority",
+}
+
+BC_COMBINATION_STRATEGY_BY_METHOD = {
+    "success_replay_best_adaptive_pcgrad": "adaptive_additive",
+    "success_replay_best_random_broader_adaptive_pcgrad": "adaptive_additive",
+    "success_replay_best_llm_broader_adaptive_pcgrad": "adaptive_additive",
+    "success_replay_best_progress_pcgrad": "adaptive_additive",
+    "success_replay_best_llm_schedule_pcgrad": "adaptive_additive",
+    "success_replay_best_llm_prior_pcgrad": "adaptive_additive",
+    "success_replay_best_cagrad": "cagrad",
+    "success_replay_best_conflict_lora": "adaptive_additive",
 }
 
 
@@ -90,6 +134,11 @@ def bc_gradient_strategy_for_method(method_id: str) -> str:
     return BC_GRADIENT_STRATEGY_BY_METHOD.get(method_id, "standard")
 
 
+def required_bc_combination_strategy(method_id: str) -> str | None:
+    get_method(method_id)
+    return BC_COMBINATION_STRATEGY_BY_METHOD.get(method_id)
+
+
 def is_method_compatible(mode: str, method_id: str) -> bool:
     return mode in get_method(method_id).modes
 
@@ -97,6 +146,7 @@ def is_method_compatible(mode: str, method_id: str) -> bool:
 __all__ = [
     "METHOD_REGISTRY",
     "BC_GRADIENT_STRATEGY_BY_METHOD",
+    "BC_COMBINATION_STRATEGY_BY_METHOD",
     "MethodSpec",
     "available_method_ids",
     "bc_gradient_strategy_for_method",
@@ -104,4 +154,5 @@ __all__ = [
     "get_method",
     "is_method_compatible",
     "method_defaults",
+    "required_bc_combination_strategy",
 ]

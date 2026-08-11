@@ -1,0 +1,15 @@
+{
+  "source": "Project task profiles for Meta-World v3 CW10 under the cw10_v1 reward protocol.",
+  "tasks": {
+    "hammer-v3": {"official_description": "Hammer a screw into a wall with a hammer.", "interaction_structure": "tool acquisition followed by aligned impact", "likely_stages": ["approach", "grasp", "align_tool", "impact"]},
+    "push-wall-v3": {"official_description": "Push a puck to a goal while bypassing a wall.", "interaction_structure": "obstacle-aware direct planar pushing", "likely_stages": ["approach", "align", "push"]},
+    "faucet-close-v3": {"official_description": "Rotate a faucet clockwise to turn it off.", "interaction_structure": "direct handle engagement and constrained rotation", "likely_stages": ["approach", "engage", "rotate"]},
+    "push-back-v3": {"official_description": "Pull a puck to a goal.", "interaction_structure": "rear-side alignment and direct sustained planar motion", "likely_stages": ["approach", "align", "move"]},
+    "stick-pull-v3": {"official_description": "Grasp a stick and use it to pull a box.", "interaction_structure": "grasp and lift a tool, align it to a handle, then preserve tool-object contact while indirectly moving the box", "reward_protocol_note": "v3 environment with the project v1-compatible reward observation alignment", "likely_stages": ["approach_tool", "grasp_tool", "lift_tool", "align_tool_to_handle", "engage_handle", "pull_box"]},
+    "handle-press-side-v3": {"official_description": "Press a handle down sideways.", "interaction_structure": "direct side alignment and pressing", "likely_stages": ["approach", "align", "press"]},
+    "push-v3": {"official_description": "Push a puck to a goal.", "interaction_structure": "direct sustained planar pushing", "likely_stages": ["approach", "align", "push"]},
+    "shelf-place-v3": {"official_description": "Pick up a puck and place it on a shelf.", "interaction_structure": "direct grasp, lift, transport, alignment, and release", "likely_stages": ["approach", "grasp", "lift", "transport", "place"]},
+    "window-close-v3": {"official_description": "Push and close a window.", "interaction_structure": "direct handle engagement and constrained sliding", "likely_stages": ["approach", "engage", "slide"]},
+    "peg-unplug-side-v3": {"official_description": "Unplug a peg sideways.", "interaction_structure": "direct grasp and constrained lateral extraction", "likely_stages": ["approach", "grasp", "extract"]}
+  }
+}

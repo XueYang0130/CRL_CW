@@ -17,7 +17,11 @@ from agents.gradient_diagnostics import (
 )
 from envs import get_cw10_tasks, make_cw_env
 from evaluation import EvaluationConfig, SACEvaluator, summarize_continual_run
-from methods import bc_gradient_strategy_for_method, get_method
+from methods import (
+    bc_gradient_strategy_for_method,
+    get_method,
+    required_bc_combination_strategy,
+)
 from training.sac_trainer import SACTrainer, SACTrainerConfig, seed_global_rngs
 from training.semantic_segments import (
     SEGMENT_ORDER,
@@ -39,7 +43,34 @@ from training.llm_controller import (
     call_openai_json_controller,
     read_api_key,
 )
-from training.success_replay import SuccessfulStateReservoir
+from training.llm_bc_schedule_controller import (
+    LLMBCScheduleDecision,
+    SCHEDULE_DELAYED,
+    SCHEDULE_STANDARD,
+    build_task_schedule_prompt,
+    call_task_schedule_controller,
+    standard_fallback_decision,
+)
+from training.llm_policy_prior_controller import (
+    LLMPolicyPriorDecision,
+    build_policy_prior_prompt,
+    call_policy_prior_controller,
+    no_transfer_decision,
+    resolve_prior_exploration,
+)
+from training.llm_broader_replay_controller import (
+    build_broader_replay_prompt,
+    call_broader_replay_controller,
+    random_baseline_decision,
+    random_fallback_decision,
+)
+from training.implicit_policy_prior import (
+    PriorInitializationResult,
+    collect_reset_observations,
+    initialize_actor_head_from_source,
+)
+from training.success_replay import BroaderStateReservoir, SuccessfulStateReservoir
+from training.bc_progress_gate import BCProgressGate
 from utils import append_csv_rows, save_sac_checkpoint, write_csv, write_json
 
 
@@ -67,6 +98,9 @@ CW10_EVAL_FIELDS = [
     "q2_mean",
     "q_target_mean",
     "log_prob_mean",
+    "bc_progress_score",
+    "bc_progress_multiplier",
+    "bc_progress_next_multiplier",
     "elapsed_seconds",
 ]
 
@@ -89,7 +123,17 @@ CW10_TASK_SUMMARY_FIELDS = [
     "curriculum_transitions",
     "reference_success_episodes",
     "reference_states",
+    "successful_reference_states",
     "success_replay_seen_states",
+    "broader_replay_selector",
+    "broader_replay_ratio",
+    "broader_replay_target_states",
+    "broader_replay_states",
+    "broader_replay_quota_filled",
+    "broader_replay_candidate_counts",
+    "broader_replay_selected_bins",
+    "broader_replay_selection_source",
+    "broader_replay_selection_reason",
     "background_reference_states",
     "task_specific_reference_states",
     "semantic_segment_scheme",
@@ -104,6 +148,16 @@ CW10_TASK_SUMMARY_FIELDS = [
     "best_teacher_step",
     "best_teacher_success",
     "best_teacher_return",
+    "bc_task_schedule",
+    "bc_task_schedule_source",
+    "bc_task_schedule_confidence",
+    "policy_prior_source_task",
+    "policy_prior_confidence",
+    "policy_prior_decision_source",
+    "policy_prior_initial_kl",
+    "policy_prior_final_kl",
+    "bc_task_schedule_reason_codes",
+    "bc_task_schedule_reason",
 ]
 
 
@@ -1069,6 +1123,17 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 f"Method-agent gradient strategy mismatch: method={args.method}, "
                 f"expected={expected_strategy}, actual={actual_strategy}."
             )
+        required_combination = required_bc_combination_strategy(args.method)
+        actual_combination = str(agent.bc_combination_strategy)
+        if (
+            required_combination is not None
+            and actual_combination != required_combination
+        ):
+            raise RuntimeError(
+                "Method-agent BC combination strategy mismatch: "
+                f"method={args.method}, expected={required_combination}, "
+                f"actual={actual_combination}."
+            )
     if hasattr(agent, "gradient_diagnostics"):
         actual_diagnostics = bool(agent.gradient_diagnostics.enabled)
         if actual_diagnostics != bool(args.gradient_diagnostics):
@@ -1111,6 +1176,15 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         else None
     )
     last_update_metrics: dict[str, float] | None = None
+    global_progress_gate = (
+        BCProgressGate(
+            thresholds=tuple(args.bc_progress_thresholds),
+            multipliers=tuple(args.bc_progress_multipliers),
+            window=args.bc_progress_window,
+        )
+        if args.bc_progress_gate
+        else None
+    )
 
     def flush_gradient_diagnostics(
         *,
@@ -1167,8 +1241,121 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
     llm_api_key = None
     if args.segment_selection_mode == "llm_online":
         llm_api_key = read_api_key(args.llm_controller_api_key_env)
+    schedule_api_key = None
+    schedule_api_key_error: str | None = None
+    if args.llm_task_bc_schedule:
+        try:
+            schedule_api_key = read_api_key(args.llm_controller_api_key_env)
+        except Exception as error:
+            schedule_api_key_error = f"{type(error).__name__}: {error}"
+    prior_api_key = None
+    prior_api_key_error: str | None = None
+    if method.llm_prior_initialization:
+        try:
+            prior_api_key = read_api_key(args.llm_controller_api_key_env)
+        except Exception as error:
+            prior_api_key_error = f"{type(error).__name__}: {error}"
+    broader_replay_api_key = None
+    broader_replay_api_key_error: str | None = None
+    if method.broader_replay_selector == "llm":
+        try:
+            broader_replay_api_key = read_api_key(args.llm_controller_api_key_env)
+        except Exception as error:
+            broader_replay_api_key_error = f"{type(error).__name__}: {error}"
 
     for task_index, task_name in enumerate(tasks):
+        prior_decision: LLMPolicyPriorDecision | None = None
+        prior_result: PriorInitializationResult | None = None
+        active_progress_gate = global_progress_gate
+        schedule_decision: LLMBCScheduleDecision | None = None
+        if args.llm_task_bc_schedule:
+            if task_index == 0:
+                schedule_decision = standard_fallback_decision(
+                    "No old-task memory exists for the first task."
+                )
+                schedule_decision = LLMBCScheduleDecision(
+                    **{**schedule_decision.__dict__, "source": "first_task"}
+                )
+                append_controller_log(
+                    run_dir / "bc_schedule_decisions.json",
+                    {
+                        "task_index": task_index,
+                        "task_name": task_name,
+                        "visible_previous_task_indices": [],
+                        "visible_previous_task_names": [],
+                        "model": args.llm_controller_model,
+                        "prompt_path": None,
+                        "schedule": schedule_decision.schedule,
+                        "reason_codes": list(schedule_decision.reason_codes),
+                        "confidence": schedule_decision.confidence,
+                        "reason": schedule_decision.reason,
+                        "source": schedule_decision.source,
+                        "raw_response_text": "",
+                    },
+                )
+            else:
+                prompt = build_task_schedule_prompt(
+                    current_task_name=task_name,
+                    previous_task_names=list(tasks[:task_index]),
+                    prompt_dir=args.llm_bc_schedule_prompt_dir,
+                )
+                prompt_dir = run_dir / "bc_schedule_prompts"
+                prompt_dir.mkdir(parents=True, exist_ok=True)
+                prompt_path = prompt_dir / f"task_{task_index:02d}_{task_name}.txt"
+                prompt_path.write_text(prompt, encoding="utf-8")
+                try:
+                    if schedule_api_key is None:
+                        raise RuntimeError(
+                            "LLM schedule API key was not loaded: "
+                            f"{schedule_api_key_error or 'unknown error'}"
+                        )
+                    schedule_decision = call_task_schedule_controller(
+                        api_key=schedule_api_key,
+                        model=args.llm_controller_model,
+                        prompt=prompt,
+                        max_output_tokens=args.llm_controller_max_output_tokens,
+                    )
+                except Exception as error:
+                    schedule_decision = standard_fallback_decision(
+                        f"Controller failure: {type(error).__name__}: {error}"
+                    )
+                append_controller_log(
+                    run_dir / "bc_schedule_decisions.json",
+                    {
+                        "task_index": task_index,
+                        "task_name": task_name,
+                        "visible_previous_task_indices": list(range(task_index)),
+                        "visible_previous_task_names": list(tasks[:task_index]),
+                        "model": args.llm_controller_model,
+                        "prompt_path": str(prompt_path.relative_to(run_dir)),
+                        "schedule": schedule_decision.schedule,
+                        "reason_codes": list(schedule_decision.reason_codes),
+                        "confidence": schedule_decision.confidence,
+                        "reason": schedule_decision.reason,
+                        "source": schedule_decision.source,
+                        "raw_response_text": schedule_decision.raw_response_text,
+                    },
+                )
+            active_progress_gate = (
+                BCProgressGate(
+                    thresholds=tuple(args.bc_progress_thresholds),
+                    multipliers=tuple(args.bc_progress_multipliers),
+                    window=args.bc_progress_window,
+                )
+                if schedule_decision.schedule == SCHEDULE_DELAYED
+                else None
+            )
+            print(
+                f"[bc-schedule] task={task_name} schedule={schedule_decision.schedule} "
+                f"source={schedule_decision.source} confidence={schedule_decision.confidence:.3f}"
+            )
+        if active_progress_gate is not None:
+            if not isinstance(agent, FullBehaviorCloningSACAgent):
+                raise RuntimeError("BC progress gate requires FullBehaviorCloningSACAgent.")
+            active_progress_gate.reset()
+            agent.set_bc_progress_multiplier(active_progress_gate.multiplier)
+        elif isinstance(agent, FullBehaviorCloningSACAgent):
+            agent.set_bc_progress_multiplier(1.0)
         leaked_sources = sorted(
             source_index
             for source_index in llm_memory_source_task_indices
@@ -1184,15 +1371,32 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         active_reference_states = 0
         active_background_reference_states = 0
         active_task_specific_reference_states = 0
+        success_replay_capacity = int(
+            round(args.episodic_memory_per_task * (1.0 - method.broader_replay_ratio))
+        )
+        broader_replay_capacity = args.episodic_memory_per_task - success_replay_capacity
         success_replay = (
             SuccessfulStateReservoir(
-                capacity=args.episodic_memory_per_task,
+                capacity=success_replay_capacity,
                 observation_dim=observation_dim,
                 seed=args.seed + 600_000 + task_index,
             )
             if method.success_replay_teacher is not None
             else None
         )
+        broader_replay = (
+            BroaderStateReservoir(
+                capacity_per_bin=broader_replay_capacity,
+                observation_dim=observation_dim,
+                seed=args.seed + 650_000 + task_index,
+            )
+            if method.broader_replay_selector is not None
+            else None
+        )
+        if method.broader_replay_selector is not None and (
+            success_replay_capacity <= 0 or broader_replay_capacity <= 0
+        ):
+            raise RuntimeError("Broader replay requires non-empty success and broader quotas.")
         best_teacher_state: dict[str, torch.Tensor] | None = None
         best_teacher_score = (float("-inf"), float("-inf"))
         best_teacher_step: int | None = None
@@ -1331,6 +1535,9 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             task_index=task_index,
             strategy=effective_exploration_strategy,
         )
+        actual_exploration_strategy = (
+            "random" if exploration_strategy is None else exploration_strategy
+        )
 
         env = make_cw_env(
             task_name,
@@ -1341,6 +1548,91 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             reward_function_version=args.reward_function_version,
             num_task_ids=len(tasks),
         )
+        if method.llm_prior_initialization:
+            if task_index == 0:
+                prior_decision = no_transfer_decision(
+                    "No previous policy head exists for the first task.",
+                    source="first_task",
+                )
+                prior_prompt_path = None
+            else:
+                prior_prompt = build_policy_prior_prompt(
+                    current_task_name=task_name,
+                    previous_task_names=list(tasks[:task_index]),
+                    prompt_dir=args.llm_prior_prompt_dir,
+                )
+                prior_prompt_dir = run_dir / "policy_prior_prompts"
+                prior_prompt_dir.mkdir(parents=True, exist_ok=True)
+                prior_prompt_file = prior_prompt_dir / f"task_{task_index:02d}_{task_name}.txt"
+                prior_prompt_file.write_text(prior_prompt, encoding="utf-8")
+                prior_prompt_path = str(prior_prompt_file.relative_to(run_dir))
+                try:
+                    if prior_api_key is None:
+                        raise RuntimeError(
+                            "LLM prior API key was not loaded: "
+                            f"{prior_api_key_error or 'unknown error'}"
+                        )
+                    prior_decision = call_policy_prior_controller(
+                        api_key=prior_api_key,
+                        model=args.llm_controller_model,
+                        prompt=prior_prompt,
+                        max_output_tokens=args.llm_controller_max_output_tokens,
+                        previous_task_names=list(tasks[:task_index]),
+                        minimum_confidence=args.llm_prior_min_confidence,
+                    )
+                except Exception as error:
+                    prior_decision = no_transfer_decision(
+                        f"Controller failure: {type(error).__name__}: {error}"
+                    )
+            if prior_decision.source_task_name is not None:
+                source_task_index = tasks.index(prior_decision.source_task_name)
+                if source_task_index >= task_index:
+                    raise RuntimeError("Policy-prior selector leaked current or future task data.")
+                reset_observations = collect_reset_observations(
+                    env,
+                    count=args.implicit_prior_reset_states,
+                    seed=args.seed + 80_000 + task_index * 1_000,
+                )
+                prior_result = initialize_actor_head_from_source(
+                    agent,
+                    observations=reset_observations,
+                    source_task_index=source_task_index,
+                    target_task_index=task_index,
+                    updates=args.implicit_prior_updates,
+                    learning_rate=args.implicit_prior_learning_rate,
+                )
+            append_controller_log(
+                run_dir / "policy_prior_decisions.json",
+                {
+                    "task_index": task_index,
+                    "task_name": task_name,
+                    "visible_previous_task_indices": list(range(task_index)),
+                    "visible_previous_task_names": list(tasks[:task_index]),
+                    "model": args.llm_controller_model,
+                    "prompt_path": prior_prompt_path,
+                    "source_task_name": prior_decision.source_task_name,
+                    "confidence": prior_decision.confidence,
+                    "reason": prior_decision.reason,
+                    "source": prior_decision.source,
+                    "raw_response_text": prior_decision.raw_response_text,
+                    "reset_states": None if prior_result is None else prior_result.reset_states,
+                    "updates": None if prior_result is None else prior_result.updates,
+                    "initial_kl": None if prior_result is None else prior_result.initial_kl,
+                    "final_kl": None if prior_result is None else prior_result.final_kl,
+                },
+            )
+            print(
+                f"[policy-prior] task={task_name} source="
+                f"{prior_decision.source_task_name or 'none'} "
+                f"confidence={prior_decision.confidence:.3f} "
+                f"decision_source={prior_decision.source}"
+            )
+            exploration_strategy, exploration_available_heads, actual_exploration_strategy = (
+                resolve_prior_exploration(
+                    task_index=task_index,
+                    decision=prior_decision,
+                )
+            )
         selected_guide: int | None = None
         selected_guide_return: float | None = None
         if agent.requires_guide_selection(task_index):
@@ -1528,6 +1820,24 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             )
             all_eval_rows.extend(rows)
             active_row = rows[0]
+            if active_progress_gate is None:
+                active_row["bc_progress_score"] = ""
+                active_row["bc_progress_multiplier"] = ""
+                active_row["bc_progress_next_multiplier"] = ""
+            else:
+                applied_multiplier = agent.bc_progress_multiplier
+                next_multiplier = active_progress_gate.update(
+                    float(active_row["stochastic_success_rate"])
+                )
+                agent.set_bc_progress_multiplier(next_multiplier)
+                active_row["bc_progress_score"] = active_progress_gate.score
+                active_row["bc_progress_multiplier"] = applied_multiplier
+                active_row["bc_progress_next_multiplier"] = next_multiplier
+                print(
+                    f"[bc-progress] task={task_name} step={task_step:,} "
+                    f"score={active_progress_gate.score:.3f} "
+                    f"applied={applied_multiplier:.3f} next={next_multiplier:.3f}"
+                )
             task_curve_success.append(float(active_row["stochastic_success_rate"]))
             task_curve_returns.append(float(active_row["stochastic_average_return"]))
             if method.success_replay_teacher == "best":
@@ -1784,10 +2094,21 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                             }
                         )
 
+        def record_completed_episode(
+            observations: tuple[np.ndarray, ...],
+            succeeded: bool,
+        ) -> None:
+            if success_replay is not None:
+                success_replay.add_episode(observations, succeeded)
+            if broader_replay is not None:
+                broader_replay.add_episode(observations, succeeded)
+
         training_summary = trainer.train(
             step_callback=evaluate,
             completed_episode_callback=(
-                None if success_replay is None else success_replay.add_episode
+                None
+                if success_replay is None and broader_replay is None
+                else record_completed_episode
             ),
         )
         if curriculum_eval_env is not None:
@@ -1800,9 +2121,17 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         )
         reference_success_episodes = None
         reference_states = None
+        successful_reference_states = None
         background_reference_states = None
         task_specific_reference_states = None
         collected_segment_states = None
+        broader_replay_target_states = None
+        broader_replay_states = None
+        broader_replay_quota_filled = None
+        broader_replay_candidate_counts = None
+        broader_replay_selected_bins = None
+        broader_replay_selection_source = None
+        broader_replay_selection_reason = None
         if success_replay is not None:
             if not isinstance(agent, FullBehaviorCloningSACAgent):
                 raise RuntimeError(
@@ -1810,6 +2139,99 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 )
             reference_observations = success_replay.observations()
             reference_success_episodes = success_replay.successful_episodes
+            successful_reference_states = int(reference_observations.shape[0])
+            broader_observations = np.empty(
+                (0, observation_dim), dtype=np.float32
+            )
+            if broader_replay is not None:
+                broader_replay_target_states = broader_replay_capacity
+                candidate_counts = broader_replay.counts()
+                broader_replay_candidate_counts = json.dumps(
+                    candidate_counts, sort_keys=True
+                )
+                if method.broader_replay_selector == "llm":
+                    prompt_path: Path | None = None
+                    try:
+                        prompt = build_broader_replay_prompt(
+                            task_name=task_name,
+                            available_counts=candidate_counts,
+                            prompt_dir=args.llm_broader_replay_prompt_dir,
+                        )
+                        prompt_dir = run_dir / "broader_replay_prompts"
+                        prompt_dir.mkdir(parents=True, exist_ok=True)
+                        prompt_path = prompt_dir / f"task_{task_index:02d}_{task_name}.txt"
+                        prompt_path.write_text(prompt, encoding="utf-8")
+                        if broader_replay_api_key is None:
+                            raise RuntimeError(
+                                "LLM broader-replay API key was not loaded: "
+                                f"{broader_replay_api_key_error or 'unknown error'}"
+                            )
+                        broader_decision = call_broader_replay_controller(
+                            api_key=broader_replay_api_key,
+                            model=args.llm_controller_model,
+                            prompt=prompt,
+                            max_output_tokens=args.llm_controller_max_output_tokens,
+                        )
+                    except Exception as error:
+                        broader_decision = random_fallback_decision(
+                            f"Controller failure: {type(error).__name__}: {error}"
+                        )
+                else:
+                    broader_decision = random_baseline_decision(
+                        "Random broader replay baseline."
+                    )
+                selected_candidate_count = sum(
+                    candidate_counts[label] for label in broader_decision.selected_bins
+                )
+                total_candidate_count = sum(candidate_counts.values())
+                if (
+                    method.broader_replay_selector == "llm"
+                    and selected_candidate_count < broader_replay_capacity
+                    and total_candidate_count >= broader_replay_capacity
+                ):
+                    broader_decision = random_fallback_decision(
+                        "LLM-selected bins did not contain enough candidates "
+                        f"for the broader quota ({selected_candidate_count}/"
+                        f"{broader_replay_capacity}); using all temporal bins."
+                    )
+                if method.broader_replay_selector == "llm":
+                    append_controller_log(
+                        run_dir / "broader_replay_decisions.json",
+                        {
+                            "task_index": task_index,
+                            "task_name": task_name,
+                            "model": args.llm_controller_model,
+                            "prompt_path": (
+                                None
+                                if prompt_path is None
+                                else str(prompt_path.relative_to(run_dir))
+                            ),
+                            "candidate_counts": candidate_counts,
+                            "selected_bins": list(broader_decision.selected_bins),
+                            "source": broader_decision.source,
+                            "reason": broader_decision.reason,
+                            "raw_response_text": broader_decision.raw_response_text,
+                        },
+                    )
+                broader_replay_selected_bins = json.dumps(
+                    list(broader_decision.selected_bins)
+                )
+                broader_replay_selection_source = broader_decision.source
+                broader_replay_selection_reason = broader_decision.reason
+                broader_observations = broader_replay.observations(
+                    selected_bins=broader_decision.selected_bins,
+                    capacity=broader_replay_capacity,
+                    seed=args.seed + 660_000 + task_index,
+                )
+                broader_replay_states = int(broader_observations.shape[0])
+                broader_replay_quota_filled = (
+                    0.0
+                    if broader_replay_capacity <= 0
+                    else broader_replay_states / broader_replay_capacity
+                )
+            reference_observations = np.concatenate(
+                (reference_observations, broader_observations), axis=0
+            )
             reference_states = int(reference_observations.shape[0])
             if reference_states > 0:
                 if (
@@ -2030,6 +2452,12 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     "bc_gradient_strategy",
                     None,
                 ),
+                "bc_combination_strategy": getattr(
+                    agent,
+                    "bc_combination_strategy",
+                    None,
+                ),
+                "bc_cagrad_alpha": getattr(agent, "bc_cagrad_alpha", None),
             },
         )
         task_summary_rows.append(
@@ -2039,7 +2467,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 "exploration_strategy": (
                     "best_return"
                     if selected_guide is not None
-                    else effective_exploration_strategy
+                    else actual_exploration_strategy
                 ),
                 "selected_exploration_head": selected_guide,
                 "selected_exploration_source_task": (
@@ -2060,11 +2488,21 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 "curriculum_transitions": json.dumps(curriculum_transitions),
                 "reference_success_episodes": reference_success_episodes,
                 "reference_states": reference_states,
+                "successful_reference_states": successful_reference_states,
                 "success_replay_seen_states": (
                     None
                     if success_replay is None
                     else success_replay.seen_successful_states
                 ),
+                "broader_replay_selector": method.broader_replay_selector,
+                "broader_replay_ratio": method.broader_replay_ratio,
+                "broader_replay_target_states": broader_replay_target_states,
+                "broader_replay_states": broader_replay_states,
+                "broader_replay_quota_filled": broader_replay_quota_filled,
+                "broader_replay_candidate_counts": broader_replay_candidate_counts,
+                "broader_replay_selected_bins": broader_replay_selected_bins,
+                "broader_replay_selection_source": broader_replay_selection_source,
+                "broader_replay_selection_reason": broader_replay_selection_reason,
                 "background_reference_states": background_reference_states,
                 "task_specific_reference_states": task_specific_reference_states,
                 "semantic_segment_scheme": (
@@ -2112,6 +2550,38 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 ),
                 "best_teacher_return": (
                     None if best_teacher_step is None else best_teacher_score[1]
+                ),
+                "bc_task_schedule": (
+                    None if schedule_decision is None else schedule_decision.schedule
+                ),
+                "bc_task_schedule_source": (
+                    None if schedule_decision is None else schedule_decision.source
+                ),
+                "bc_task_schedule_confidence": (
+                    None if schedule_decision is None else schedule_decision.confidence
+                ),
+                "policy_prior_source_task": (
+                    None if prior_decision is None else prior_decision.source_task_name
+                ),
+                "policy_prior_confidence": (
+                    None if prior_decision is None else prior_decision.confidence
+                ),
+                "policy_prior_decision_source": (
+                    None if prior_decision is None else prior_decision.source
+                ),
+                "policy_prior_initial_kl": (
+                    None if prior_result is None else prior_result.initial_kl
+                ),
+                "policy_prior_final_kl": (
+                    None if prior_result is None else prior_result.final_kl
+                ),
+                "bc_task_schedule_reason_codes": (
+                    None
+                    if schedule_decision is None
+                    else json.dumps(list(schedule_decision.reason_codes))
+                ),
+                "bc_task_schedule_reason": (
+                    None if schedule_decision is None else schedule_decision.reason
                 ),
             }
         )

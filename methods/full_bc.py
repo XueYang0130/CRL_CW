@@ -19,6 +19,7 @@ def build_agent(
         bc_combination_strategy=args.bc_combination_strategy,
         bc_adaptive_target_ratio=args.bc_adaptive_target_ratio,
         bc_adaptive_conflict_ratio=args.bc_adaptive_conflict_ratio,
+        bc_cagrad_alpha=args.bc_cagrad_alpha,
         gradient_diagnostics=args.gradient_diagnostics,
         gradient_diagnostics_interval=args.gradient_diagnostics_interval,
         gradient_diagnostics_source_batch_size=args.gradient_diagnostics_source_batch_size,

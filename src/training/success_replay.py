@@ -5,6 +5,89 @@ import random
 import numpy as np
 
 
+BROADER_TEMPORAL_BINS: tuple[str, ...] = ("early", "middle", "late")
+
+
+class BroaderStateReservoir:
+    """Fixed-capacity temporal reservoirs from non-successful episodes."""
+
+    def __init__(self, *, capacity_per_bin: int, observation_dim: int, seed: int) -> None:
+        if capacity_per_bin <= 0:
+            raise ValueError("capacity_per_bin must be positive.")
+        if observation_dim <= 0:
+            raise ValueError("observation_dim must be positive.")
+        self.capacity_per_bin = int(capacity_per_bin)
+        self.observation_dim = int(observation_dim)
+        self._rng = {
+            label: random.Random(seed + index)
+            for index, label in enumerate(BROADER_TEMPORAL_BINS)
+        }
+        self._states: dict[str, list[np.ndarray]] = {
+            label: [] for label in BROADER_TEMPORAL_BINS
+        }
+        self._seen: dict[str, int] = {label: 0 for label in BROADER_TEMPORAL_BINS}
+        self.non_successful_episodes = 0
+
+    def add_episode(
+        self,
+        observations: tuple[np.ndarray, ...],
+        succeeded: bool,
+    ) -> None:
+        # The broader component is deliberately disjoint from the successful 80%.
+        if succeeded or not observations:
+            return
+        self.non_successful_episodes += 1
+        episode_length = len(observations)
+        for step, observation in enumerate(observations):
+            state = np.asarray(observation, dtype=np.float32)
+            if state.shape != (self.observation_dim,):
+                raise ValueError(
+                    f"Broader replay observation has shape {state.shape}, "
+                    f"expected {(self.observation_dim,)}."
+                )
+            if not bool(np.isfinite(state).all()):
+                raise ValueError("Broader replay observations must be finite.")
+            progress = (step + 0.5) / episode_length
+            label = BROADER_TEMPORAL_BINS[min(int(progress * 3), 2)]
+            self._seen[label] += 1
+            states = self._states[label]
+            if len(states) < self.capacity_per_bin:
+                states.append(state.copy())
+                continue
+            replacement = self._rng[label].randrange(self._seen[label])
+            if replacement < self.capacity_per_bin:
+                states[replacement] = state.copy()
+
+    def counts(self) -> dict[str, int]:
+        return {label: len(self._states[label]) for label in BROADER_TEMPORAL_BINS}
+
+    def observations(
+        self,
+        *,
+        selected_bins: tuple[str, ...] = BROADER_TEMPORAL_BINS,
+        capacity: int,
+        seed: int,
+    ) -> np.ndarray:
+        if capacity < 0:
+            raise ValueError("capacity must be non-negative.")
+        invalid = sorted(set(selected_bins).difference(BROADER_TEMPORAL_BINS))
+        if invalid:
+            raise ValueError(f"Unknown broader temporal bins: {invalid}.")
+        if capacity == 0 or not selected_bins:
+            return np.empty((0, self.observation_dim), dtype=np.float32)
+        candidates = [
+            state
+            for label in selected_bins
+            for state in self._states[label]
+        ]
+        if not candidates:
+            return np.empty((0, self.observation_dim), dtype=np.float32)
+        rng = random.Random(seed)
+        if len(candidates) > capacity:
+            candidates = rng.sample(candidates, capacity)
+        return np.stack(candidates).astype(np.float32, copy=False)
+
+
 class SuccessfulStateReservoir:
     """Uniform fixed-capacity sample of states from successful train episodes."""
 

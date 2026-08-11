@@ -11,6 +11,40 @@ from methods import get_method
 
 
 class TestCliPrecedence(unittest.TestCase):
+    def test_success_replay_cagrad_preset(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "run.py",
+                "--mode",
+                "continual",
+                "--method",
+                "success_replay_best_cagrad",
+            ],
+        ):
+            args = parse_args()
+        self.assertEqual(args.bc_gradient_strategy, "standard")
+        self.assertEqual(args.bc_combination_strategy, "cagrad")
+        self.assertEqual(args.bc_cagrad_alpha, 0.5)
+        self.assertEqual(args.episodic_memory_per_task, 10_000)
+
+    def test_success_replay_cagrad_rejects_combination_override(self) -> None:
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "run.py",
+                "--mode",
+                "continual",
+                "--method",
+                "success_replay_best_cagrad",
+                "--bc-combination-strategy",
+                "average",
+            ],
+        ), self.assertRaises(SystemExit):
+            parse_args()
+
     def test_gradient_method_presets_select_expected_strategy(self) -> None:
         expected = {
             "full_bc": "standard",
@@ -97,6 +131,7 @@ class TestCliPrecedence(unittest.TestCase):
             ["--gradient-clip-norm", "nan"],
             ["--actor-cloning-coefficient", "nan"],
             ["--bc-max-norm-ratio", "inf"],
+            ["--bc-cagrad-alpha", "1.0"],
             ["--background-segment-ratio", "nan"],
             ["--task-specific-segment-ratio", "inf"],
         )

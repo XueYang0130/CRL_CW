@@ -8,6 +8,7 @@ from agents.networks import (
 )
 from agents.replay_buffer import ReplayBatch, ReplayBuffer
 from agents.clonex_sac_agent import ClonExSACAgent
+from agents.conflict_lora_agent import ConflictLoRAFullBCAgent
 from agents.full_bc_agent import FullBehaviorCloningSACAgent
 from agents.local_bc_agent import LocalBehaviorCloningSACAgent
 from agents.packnet_agent import PackNetSACAgent
@@ -30,6 +31,7 @@ __all__ = [
     "ReplayBatch",
     "ReplayBuffer",
     "ClonExSACAgent",
+    "ConflictLoRAFullBCAgent",
     "FullBehaviorCloningSACAgent",
     "LocalBehaviorCloningSACAgent",
     "PackNetSACAgent",

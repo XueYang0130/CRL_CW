@@ -29,6 +29,7 @@ from methods import (
     get_method,
     is_method_compatible,
     method_defaults,
+    required_bc_combination_strategy,
 )
 from training import run_cw10_experiment, run_single_task_experiment
 from training.segment_selection import normalize_segment_weights
@@ -112,11 +113,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bc-max-norm-ratio", type=float, default=1.0)
     parser.add_argument(
         "--bc-combination-strategy",
-        choices=("average", "additive", "adaptive_additive"),
+        choices=("average", "additive", "adaptive_additive", "cagrad"),
         default="average",
     )
     parser.add_argument("--bc-adaptive-target-ratio", type=float, default=0.2)
     parser.add_argument("--bc-adaptive-conflict-ratio", type=float, default=0.05)
+    parser.add_argument("--bc-cagrad-alpha", type=float, default=0.5)
+    parser.add_argument("--conflict-lora-rank", type=int, default=4)
+    parser.add_argument("--conflict-lora-coefficient", type=float, default=1.0)
+    parser.add_argument("--conflict-lora-max-norm-ratio", type=float, default=0.25)
+    parser.add_argument(
+        "--bc-progress-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--bc-progress-thresholds",
+        nargs=3,
+        type=float,
+        default=(0.1, 0.4, 0.7),
+        metavar=("LOW", "MID", "HIGH"),
+    )
+    parser.add_argument(
+        "--bc-progress-multipliers",
+        nargs=4,
+        type=float,
+        default=(0.0, 0.1, 0.4, 1.0),
+        metavar=("EARLY", "LOW", "MID", "HIGH"),
+    )
+    parser.add_argument("--bc-progress-window", type=int, default=3)
+    parser.add_argument(
+        "--llm-task-bc-schedule",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--llm-bc-schedule-prompt-dir",
+        type=str,
+        default="prompts/llm_bc_schedule",
+    )
+    parser.add_argument("--llm-prior-prompt-dir", type=str, default="prompts/llm_policy_prior")
+    parser.add_argument("--llm-prior-min-confidence", type=float, default=0.7)
+    parser.add_argument("--implicit-prior-reset-states", type=int, default=256)
+    parser.add_argument("--implicit-prior-updates", type=int, default=500)
+    parser.add_argument("--implicit-prior-learning-rate", type=float, default=1e-3)
     parser.add_argument("--full-bc-reference-episodes", type=int, default=20)
     parser.add_argument("--full-bc-reference-max-attempts", type=int, default=80)
     parser.add_argument("--semantic-segments", nargs="+", default=None)
@@ -149,6 +189,11 @@ def parse_args() -> argparse.Namespace:
         "--llm-controller-prompt-dir",
         type=str,
         default="prompts/llm_controller",
+    )
+    parser.add_argument(
+        "--llm-broader-replay-prompt-dir",
+        type=str,
+        default="prompts/llm_broader_replay",
     )
     parser.add_argument("--gradient-clip-norm", type=float, default=None)
     parser.add_argument(
@@ -230,8 +275,25 @@ def parse_args() -> argparse.Namespace:
             f"--method {args.method} requires --bc-gradient-strategy "
             f"{expected_gradient_strategy}."
         )
+    required_combination_strategy = required_bc_combination_strategy(args.method)
+    if (
+        required_combination_strategy is not None
+        and args.bc_combination_strategy != required_combination_strategy
+    ):
+        parser.error(
+            f"--method {args.method} requires --bc-combination-strategy "
+            f"{required_combination_strategy}."
+        )
     if not is_method_compatible(args.mode, args.method):
         parser.error(f"Method '{args.method}' is not compatible with mode '{args.mode}'.")
+    if (
+        get_method(args.method).llm_prior_initialization
+        and args.exploration_strategy != "current"
+    ):
+        parser.error(
+            "Implicit policy-prior methods require --exploration-strategy current "
+            "so old heads never act in the new task."
+        )
     if (
         args.mode == "continual"
         and get_method(args.method).multi_head
@@ -351,6 +413,45 @@ def parse_args() -> argparse.Namespace:
             "--bc-adaptive-conflict-ratio cannot exceed "
             "--bc-adaptive-target-ratio."
         )
+    if not math.isfinite(args.bc_cagrad_alpha) or not 0.0 <= args.bc_cagrad_alpha < 1.0:
+        parser.error("--bc-cagrad-alpha must be finite and in [0, 1).")
+    if args.conflict_lora_rank <= 0:
+        parser.error("--conflict-lora-rank must be positive.")
+    if (
+        not math.isfinite(args.conflict_lora_coefficient)
+        or args.conflict_lora_coefficient < 0.0
+    ):
+        parser.error("--conflict-lora-coefficient must be finite and non-negative.")
+    if (
+        not math.isfinite(args.conflict_lora_max_norm_ratio)
+        or args.conflict_lora_max_norm_ratio <= 0.0
+    ):
+        parser.error("--conflict-lora-max-norm-ratio must be finite and positive.")
+    if not 0.0 <= args.llm_prior_min_confidence <= 1.0:
+        parser.error("--llm-prior-min-confidence must be in [0, 1].")
+    if args.implicit_prior_reset_states <= 0 or args.implicit_prior_updates <= 0:
+        parser.error("Implicit-prior reset states and updates must be positive.")
+    if (
+        not math.isfinite(args.implicit_prior_learning_rate)
+        or args.implicit_prior_learning_rate <= 0.0
+    ):
+        parser.error("--implicit-prior-learning-rate must be finite and positive.")
+    low, mid, high = args.bc_progress_thresholds
+    if not all(math.isfinite(value) for value in (low, mid, high)) or not (
+        0.0 <= low < mid < high <= 1.0
+    ):
+        parser.error(
+            "--bc-progress-thresholds must satisfy 0 <= LOW < MID < HIGH <= 1."
+        )
+    if len(args.bc_progress_multipliers) != 4 or not all(
+        math.isfinite(value) and 0.0 <= value <= 1.0
+        for value in args.bc_progress_multipliers
+    ):
+        parser.error(
+            "--bc-progress-multipliers must contain four finite values in [0, 1]."
+        )
+    if args.bc_progress_window <= 0:
+        parser.error("--bc-progress-window must be positive.")
     if args.gradient_clip_norm is not None and (
         not math.isfinite(args.gradient_clip_norm)
         or args.gradient_clip_norm <= 0.0

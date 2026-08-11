@@ -19,6 +19,7 @@ def make_agent(
     combination_strategy: str = "average",
     adaptive_target_ratio: float = 0.2,
     adaptive_conflict_ratio: float = 0.05,
+    cagrad_alpha: float = 0.5,
 ) -> FullBehaviorCloningSACAgent:
     return FullBehaviorCloningSACAgent(
         observation_dim=6,
@@ -36,6 +37,7 @@ def make_agent(
         bc_combination_strategy=combination_strategy,
         bc_adaptive_target_ratio=adaptive_target_ratio,
         bc_adaptive_conflict_ratio=adaptive_conflict_ratio,
+        bc_cagrad_alpha=cagrad_alpha,
         gradient_diagnostics=diagnostics,
         gradient_diagnostics_interval=diagnostics_interval,
         gradient_diagnostics_source_batch_size=4,
@@ -581,6 +583,85 @@ class TestGradientDiagnostics(unittest.TestCase):
                 rtol=0.0,
                 atol=0.0,
             )
+
+    def test_zero_progress_multiplier_preserves_full_sac_gradient(self) -> None:
+        agent = make_agent(diagnostics=True)
+        agent.set_bc_progress_multiplier(0.0)
+        sac_gradients, bc_gradients = self.conflicting_gradients(agent)
+        combined, scale = agent._combine_actor_gradients(
+            sac_gradients=sac_gradients,
+            applied_cloning_gradients=bc_gradients,
+            conflict=True,
+        )
+        self.assertEqual(scale, 0.0)
+        for actual, expected in zip(combined, sac_gradients, strict=True):
+            torch.testing.assert_close(actual, expected)
+
+    def test_cagrad_produces_finite_common_descent_direction(self) -> None:
+        agent = make_agent(
+            diagnostics=False,
+            combination_strategy="cagrad",
+            cagrad_alpha=0.5,
+        )
+        sac_gradients = [
+            torch.zeros_like(parameter) for parameter in agent.actor.parameters()
+        ]
+        bc_gradients = [
+            torch.zeros_like(parameter) for parameter in agent.actor.parameters()
+        ]
+        shared_index = agent.gradient_diagnostics.shared_indices[0]
+        sac_gradients[shared_index].reshape(-1)[:2] = torch.tensor([1.0, 0.0])
+        bc_gradients[shared_index].reshape(-1)[:2] = torch.tensor([-0.2, 1.0])
+        sac_gradients = tuple(sac_gradients)
+        bc_gradients = tuple(bc_gradients)
+
+        combined, sac_weight = agent._combine_actor_gradients(
+            sac_gradients=sac_gradients,
+            applied_cloning_gradients=bc_gradients,
+            conflict=True,
+        )
+
+        self.assertGreaterEqual(sac_weight, 0.0)
+        self.assertLessEqual(sac_weight, 1.0)
+        self.assertTrue(all(bool(torch.isfinite(value).all()) for value in combined))
+        sac_dot = sum(
+            (combined[index] * sac_gradients[index]).sum()
+            for index in agent.gradient_diagnostics.shared_indices
+        )
+        bc_dot = sum(
+            (combined[index] * bc_gradients[index]).sum()
+            for index in agent.gradient_diagnostics.shared_indices
+        )
+        self.assertGreater(float(sac_dot), 0.0)
+        self.assertGreater(float(bc_dot), 0.0)
+
+    def test_cagrad_zero_progress_is_exact_sac_update(self) -> None:
+        agent = make_agent(diagnostics=False, combination_strategy="cagrad")
+        agent.set_bc_progress_multiplier(0.0)
+        sac_gradients, bc_gradients = self.conflicting_gradients(agent)
+        combined, scale = agent._combine_actor_gradients(
+            sac_gradients=sac_gradients,
+            applied_cloning_gradients=bc_gradients,
+            conflict=True,
+        )
+        self.assertEqual(scale, 0.0)
+        for actual, expected in zip(combined, sac_gradients, strict=True):
+            torch.testing.assert_close(actual, expected)
+
+    def test_cagrad_runs_through_actor_update_and_diagnostics(self) -> None:
+        agent = make_agent(
+            diagnostics=True,
+            combination_strategy="cagrad",
+            cagrad_alpha=0.5,
+        )
+        self.add_task_zero_memory(agent)
+        self.update_task_one(agent)
+        rows = agent.drain_gradient_diagnostics()["windows"]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(row["bc_combination_strategy"] == "cagrad" for row in rows))
+        self.assertTrue(
+            all(0.0 <= float(row["bc_combination_scale"]) <= 1.0 for row in rows)
+        )
 
 
 if __name__ == "__main__":

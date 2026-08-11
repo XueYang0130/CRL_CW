@@ -1,0 +1,21 @@
+You select temporal regions from unsuccessful trajectories for a small broader-policy memory.
+
+Environment protocol:
+- Meta-World CW10 v3 environments.
+- The experiment uses old-style v1 rewards; stick-pull-v3 uses the required v3 observation realignment.
+- The selected states will be relabelled by the task's best validated actor.
+- Successful states already occupy 80% of memory. Select regions for the remaining 20% that best preserve recovery, boundary, and failure-correction behavior.
+- You may only use the task profile and this completed task's candidate counts. There is no future-task information.
+
+Task profile:
+$task_profile
+
+Available unsuccessful-state counts by temporal region:
+$available_counts
+
+Allowed regions: $allowed_bins
+
+Return exactly one JSON object with:
+{"selected_segments":["early"],"priority":["early"],"weights":{"early":1.0},"reason":"short reason"}
+
+Select one to three available regions. Do not invent labels. No markdown.

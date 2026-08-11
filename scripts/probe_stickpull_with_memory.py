@@ -22,7 +22,11 @@ from agents import FullBehaviorCloningSACAgent, ReplayBuffer
 from envs import DEFAULT_EPISODE_LENGTH, make_cw_env
 from evaluation import EvaluationConfig, SACEvaluator
 from methods import get_method
-from training.sac_trainer import SACTrainer, SACTrainerConfig
+from training.sac_trainer import (
+    SACTrainer,
+    SACTrainerConfig,
+    seed_global_rngs,
+)
 from utils import load_sac_checkpoint, save_sac_checkpoint, write_csv, write_json
 
 
@@ -258,6 +262,9 @@ def evaluate_task(
 
 def main() -> None:
     args = parse_args()
+    # The probe builds and restores the agent before SACTrainer starts, so its
+    # global RNGs must be seeded here to make same-seed ablations comparable.
+    seed_global_rngs(args.seed)
     run_dir = Path(args.run_dir).expanduser().resolve()
     config = load_json(run_dir / "config.json")
     output_dir = make_output_dir(args, run_dir)
