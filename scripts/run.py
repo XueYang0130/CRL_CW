@@ -100,6 +100,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--reset-buffer-on-task-change", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reset-optimizer-on-task-change", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reset-critic-on-task-change", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--critic-reset-task-indices",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional task indices that should reset critics at task start. "
+            "If provided, only these tasks reset and all other tasks keep transferred critics."
+        ),
+    )
+    parser.add_argument("--adaptive-critic-init", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--critic-probe-transitions", type=int, default=5000)
+    parser.add_argument("--critic-warmup-updates", type=int, default=500)
+    parser.add_argument("--critic-route-manifest", type=str, default=None)
     parser.add_argument("--baseline-curves", type=str, default=None)
     parser.add_argument("--packnet-retrain-steps", type=int, default=0)
     parser.add_argument("--episodic-memory-per-task", type=int, default=0)
@@ -461,6 +476,24 @@ def parse_args() -> argparse.Namespace:
         )
     if args.best_return_eval_episodes <= 0:
         parser.error("--best-return-eval-episodes must be positive.")
+    if args.adaptive_critic_init and args.reset_critic_on_task_change:
+        parser.error(
+            "--adaptive-critic-init and --reset-critic-on-task-change are "
+            "mutually exclusive."
+        )
+    if args.adaptive_critic_init and args.critic_reset_task_indices:
+        parser.error(
+            "--adaptive-critic-init and --critic-reset-task-indices are "
+            "mutually exclusive."
+        )
+    if args.critic_probe_transitions <= 0:
+        parser.error("--critic-probe-transitions must be positive.")
+    if args.critic_warmup_updates <= 0:
+        parser.error("--critic-warmup-updates must be positive.")
+    if args.critic_reset_task_indices is not None:
+        for index in args.critic_reset_task_indices:
+            if index < 0:
+                parser.error("--critic-reset-task-indices must be non-negative.")
     if args.full_bc_reference_episodes <= 0:
         parser.error("--full-bc-reference-episodes must be positive.")
     if args.full_bc_reference_max_attempts < args.full_bc_reference_episodes:
@@ -780,13 +813,17 @@ def run_continual(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    wall_start = time.time()
     if args.mode == "single":
         run_single(args)
-        return
-    if args.mode == "single-batch":
+    elif args.mode == "single-batch":
         run_single_batch(args)
-        return
-    run_continual(args)
+    else:
+        run_continual(args)
+    elapsed = time.time() - wall_start
+    hours, remainder = divmod(int(elapsed), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    print(f"Total wall-clock time: {hours}h {minutes}m {seconds}s ({elapsed:.1f}s)")
 
 
 if __name__ == "__main__":

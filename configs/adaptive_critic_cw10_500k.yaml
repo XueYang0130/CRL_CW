@@ -1,0 +1,14 @@
+mode: continual
+method: success_replay_best_adaptive_pcgrad
+adaptive_critic_init: true
+critic_probe_transitions: 5000
+critic_warmup_updates: 500
+env_version: v3
+reward_function_version: cw10_v1
+sequence_task_count: 10
+steps_per_task: 500000
+eval_every: 20000
+stoch_eval_episodes: 5
+det_eval_episodes: 0
+max_episode_steps: 200
+device: cuda

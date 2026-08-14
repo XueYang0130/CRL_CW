@@ -13,6 +13,10 @@ from agents.full_bc_agent import FullBehaviorCloningSACAgent
 from agents.local_bc_agent import LocalBehaviorCloningSACAgent
 from agents.packnet_agent import PackNetSACAgent
 from agents.sac_agent import SACAgent
+from agents.semantic_routed_dual_critic_agent import (
+    SemanticRoutedDualCriticAgent,
+    SemanticRoutedFrozenTransferCriticAgent,
+)
 from agents.wsrl_continual_agent import WSRLContinualAgent
 from agents.sac_losses import (
     compute_actor_loss,
@@ -36,6 +40,8 @@ __all__ = [
     "LocalBehaviorCloningSACAgent",
     "PackNetSACAgent",
     "SACAgent",
+    "SemanticRoutedDualCriticAgent",
+    "SemanticRoutedFrozenTransferCriticAgent",
     "WSRLContinualAgent",
     "compute_actor_loss",
     "compute_alpha_loss",

@@ -71,6 +71,8 @@ from training.implicit_policy_prior import (
 )
 from training.success_replay import BroaderStateReservoir, SuccessfulStateReservoir
 from training.bc_progress_gate import BCProgressGate
+from training.critic_selection import CriticBank, CriticSelectionResult, select_best_critic
+from training.critic_routing import CriticRoute, load_critic_route_manifest
 from utils import append_csv_rows, save_sac_checkpoint, write_csv, write_json
 
 
@@ -158,6 +160,13 @@ CW10_TASK_SUMMARY_FIELDS = [
     "policy_prior_final_kl",
     "bc_task_schedule_reason_codes",
     "bc_task_schedule_reason",
+    "critic_selection_source",
+    "critic_selection_task_index",
+    "critic_selection_final_loss",
+    "critic_route",
+    "critic_route_source",
+    "critic_route_reason",
+    "background_critic_updates",
 ]
 
 
@@ -1072,6 +1081,7 @@ def collect_reference_payloads_by_segment(
 def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
     seed_global_rngs(args.seed)
     tasks = get_cw10_tasks(args.env_version)[: args.sequence_task_count]
+    critic_reset_task_indices = set(getattr(args, "critic_reset_task_indices", []) or [])
     started_at = time.time()
     method = get_method(args.method)
     append_task_id = method.append_task_id
@@ -1165,6 +1175,21 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
     global_step = 0
     cumulative_gradient_updates = 0
     evaluation_index = 0
+    critic_bank = CriticBank() if getattr(args, "adaptive_critic_init", False) else None
+    critic_routes: dict[int, CriticRoute] | None = None
+    routed_critic_methods = {
+        "semantic_routed_dual_critic_pcgrad",
+        "semantic_routed_frozen_transfer_pcgrad",
+    }
+    if args.method in routed_critic_methods:
+        if not args.critic_route_manifest:
+            raise ValueError(
+                f"{args.method} requires --critic-route-manifest."
+            )
+        critic_routes = load_critic_route_manifest(
+            args.critic_route_manifest,
+            tasks=tasks,
+        )
     segment_selection_manifest = (
         load_segment_selection_manifest(args.segment_selection_manifest)
         if args.segment_selection_manifest
@@ -1264,6 +1289,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             broader_replay_api_key_error = f"{type(error).__name__}: {error}"
 
     for task_index, task_name in enumerate(tasks):
+        critic_route = None if critic_routes is None else critic_routes[task_index]
         prior_decision: LLMPolicyPriorDecision | None = None
         prior_result: PriorInitializationResult | None = None
         active_progress_gate = global_progress_gate
@@ -1403,12 +1429,56 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         effective_exploration_strategy = normalize_exploration_strategy(
             args.exploration_strategy
         )
+        if critic_route is not None:
+            if not hasattr(agent, "configure_critic_route"):
+                raise RuntimeError("Configured method does not support critic routing.")
+            agent.configure_critic_route(critic_route.route)
         agent.on_task_start(
             task_index=task_index,
             replay_buffer=replay_buffer,
         )
         if task_index > 0 and args.reset_buffer_on_task_change:
             replay_buffer.clear()
+        env = make_cw_env(
+            task_name,
+            seed=args.seed + task_index,
+            max_episode_steps=args.max_episode_steps,
+            append_task_id=append_task_id,
+            env_version=args.env_version,
+            reward_function_version=args.reward_function_version,
+            num_task_ids=len(tasks),
+        )
+        critic_selection_result: CriticSelectionResult | None = None
+        if critic_route is not None:
+            print(
+                f"[critic-route] task={task_name} route={critic_route.route} "
+                f"source={critic_route.source}"
+            )
+        elif task_index > 0 and critic_bank is not None:
+            critic_selection_result = select_best_critic(
+                agent=agent,
+                env=env,
+                critic_bank=critic_bank,
+                current_task_index=task_index,
+                probe_transitions=args.critic_probe_transitions,
+                warmup_updates=args.critic_warmup_updates,
+                batch_size=args.batch_size,
+                max_episode_steps=args.max_episode_steps,
+                seed=args.seed + 90_000 + task_index * 1_000,
+            )
+            print(
+                f"[adaptive-critic] task={task_name} "
+                f"selected={critic_selection_result.selected_source} "
+                f"loss={critic_selection_result.final_td_loss:.1f}"
+            )
+        elif task_index > 0 and (
+            getattr(args, "reset_critic_on_task_change", False)
+            or task_index in critic_reset_task_indices
+        ):
+            agent.reset_critics()
+            print(f"[critic-init] task={task_name} mode=reset")
+        elif task_index > 0:
+            print(f"[critic-init] task={task_name} mode=transfer")
         if task_index > 0 and args.reset_optimizer_on_task_change:
             agent.rebuild_optimizer()
         if task_index > 0 and method.transfer_alpha:
@@ -1537,16 +1607,6 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         )
         actual_exploration_strategy = (
             "random" if exploration_strategy is None else exploration_strategy
-        )
-
-        env = make_cw_env(
-            task_name,
-            seed=args.seed + task_index,
-            max_episode_steps=args.max_episode_steps,
-            append_task_id=append_task_id,
-            env_version=args.env_version,
-            reward_function_version=args.reward_function_version,
-            num_task_ids=len(tasks),
         )
         if method.llm_prior_initialization:
             if task_index == 0:
@@ -2439,6 +2499,8 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             segment_selection = None
             task_specific_selection = None
         active_task_success_curves.append(task_curve_success)
+        if critic_bank is not None:
+            critic_bank.save(agent)
         save_sac_checkpoint(
             agent=agent,
             path=run_dir / "checkpoints" / f"task_{task_index}.pt",
@@ -2458,6 +2520,9 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     None,
                 ),
                 "bc_cagrad_alpha": getattr(agent, "bc_cagrad_alpha", None),
+                "critic_route": None if critic_route is None else critic_route.route,
+                "critic_route_source": None if critic_route is None else critic_route.source,
+                "critic_route_reason": None if critic_route is None else critic_route.reason,
             },
         )
         task_summary_rows.append(
@@ -2582,6 +2647,24 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 ),
                 "bc_task_schedule_reason": (
                     None if schedule_decision is None else schedule_decision.reason
+                ),
+                "critic_selection_source": (
+                    None if critic_selection_result is None
+                    else critic_selection_result.selected_source
+                ),
+                "critic_selection_task_index": (
+                    None if critic_selection_result is None
+                    else critic_selection_result.selected_task_index
+                ),
+                "critic_selection_final_loss": (
+                    None if critic_selection_result is None
+                    else critic_selection_result.final_td_loss
+                ),
+                "critic_route": None if critic_route is None else critic_route.route,
+                "critic_route_source": None if critic_route is None else critic_route.source,
+                "critic_route_reason": None if critic_route is None else critic_route.reason,
+                "background_critic_updates": int(
+                    getattr(agent, "background_critic_updates", 0)
                 ),
             }
         )

@@ -3,7 +3,12 @@ import unittest
 import numpy as np
 import torch
 
-from agents import ConflictLoRAFullBCAgent, FullBehaviorCloningSACAgent
+from agents import (
+    ConflictLoRAFullBCAgent,
+    FullBehaviorCloningSACAgent,
+    SemanticRoutedDualCriticAgent,
+    SemanticRoutedFrozenTransferCriticAgent,
+)
 from methods import bc_gradient_strategy_for_method, get_method
 from training.continual_experiment import (
     add_relabelled_reference_memory,
@@ -104,6 +109,14 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
                 "best",
                 "pcgrad_sac_priority",
             ),
+            "semantic_routed_dual_critic_pcgrad": (
+                "best",
+                "pcgrad_sac_priority",
+            ),
+            "semantic_routed_frozen_transfer_pcgrad": (
+                "best",
+                "pcgrad_sac_priority",
+            ),
             "success_replay_best_random_broader_adaptive_pcgrad": (
                 "best",
                 "pcgrad_sac_priority",
@@ -137,6 +150,8 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
                 self.assertEqual(method.defaults["episodic_memory_per_task"], 10_000)
                 if method_id in {
                     "success_replay_best_adaptive_pcgrad",
+                    "semantic_routed_dual_critic_pcgrad",
+                    "semantic_routed_frozen_transfer_pcgrad",
                     "success_replay_best_random_broader_adaptive_pcgrad",
                     "success_replay_best_llm_broader_adaptive_pcgrad",
                 }:
@@ -166,6 +181,119 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
                     self.assertTrue(method.defaults["bc_progress_gate"])
                 if method_id == "success_replay_best_llm_schedule_pcgrad":
                     self.assertTrue(method.defaults["llm_task_bc_schedule"])
+
+
+class SemanticRoutedDualCriticTests(unittest.TestCase):
+    def make_agent(self) -> SemanticRoutedDualCriticAgent:
+        return SemanticRoutedDualCriticAgent(
+            observation_dim=6,
+            action_dim=2,
+            action_low=np.full(2, -1.0, dtype=np.float32),
+            action_high=np.full(2, 1.0, dtype=np.float32),
+            num_tasks=2,
+            task_id_dim=2,
+            hide_task_id=True,
+            device="cpu",
+            episodic_batch_size=2,
+            actor_cloning_coefficient=100.0,
+            bc_gradient_strategy="pcgrad_sac_priority",
+            bc_combination_strategy="adaptive_additive",
+        )
+
+    def test_reset_route_restores_continuously_updated_transfer_critic(self) -> None:
+        torch.manual_seed(3)
+        agent = self.make_agent()
+        agent.configure_critic_route("reset")
+        agent.on_task_start(task_index=1, replay_buffer=object())
+        self.assertEqual(agent.active_critic_route, "reset")
+        self.assertIsNotNone(agent._transfer_critic1)
+
+        observations = torch.randn(8, 6)
+        observations[:, -2:] = torch.tensor([0.0, 1.0])
+        next_observations = torch.randn(8, 6)
+        next_observations[:, -2:] = torch.tensor([0.0, 1.0])
+        transfer_before = {
+            name: value.detach().clone()
+            for name, value in agent._transfer_critic1.state_dict().items()
+        }
+        agent.update_batch(
+            observations=observations,
+            actions=torch.tanh(torch.randn(8, 2)),
+            rewards=torch.randn(8, 1),
+            next_observations=next_observations,
+            dones=torch.zeros(8, 1),
+        )
+        self.assertEqual(agent.background_critic_updates, 1)
+        self.assertTrue(
+            any(
+                not torch.equal(transfer_before[name], value)
+                for name, value in agent._transfer_critic1.state_dict().items()
+            )
+        )
+        expected_transfer = {
+            name: value.detach().clone()
+            for name, value in agent._transfer_critic1.state_dict().items()
+        }
+        agent.on_task_end(task_index=1, replay_buffer=object(), batch_size=8)
+        self.assertEqual(agent.active_critic_route, "transfer")
+        self.assertIsNone(agent._transfer_critic1)
+        for name, value in agent.critic1.state_dict().items():
+            torch.testing.assert_close(value, expected_transfer[name])
+
+    def test_transfer_route_does_not_allocate_background_critic(self) -> None:
+        agent = self.make_agent()
+        agent.configure_critic_route("transfer")
+        agent.on_task_start(task_index=1, replay_buffer=object())
+        self.assertIsNone(agent._transfer_critic1)
+
+    def test_frozen_route_restores_exact_pre_task_transfer_critic(self) -> None:
+        torch.manual_seed(5)
+        agent = SemanticRoutedFrozenTransferCriticAgent(
+            observation_dim=6,
+            action_dim=2,
+            action_low=np.full(2, -1.0, dtype=np.float32),
+            action_high=np.full(2, 1.0, dtype=np.float32),
+            num_tasks=2,
+            task_id_dim=2,
+            hide_task_id=True,
+            device="cpu",
+            episodic_batch_size=2,
+            actor_cloning_coefficient=100.0,
+            bc_gradient_strategy="pcgrad_sac_priority",
+            bc_combination_strategy="adaptive_additive",
+        )
+        pre_task_transfer = {
+            name: value.detach().clone()
+            for name, value in agent.critic1.state_dict().items()
+        }
+        agent.configure_critic_route("reset")
+        agent.on_task_start(task_index=1, replay_buffer=object())
+
+        observations = torch.randn(8, 6)
+        observations[:, -2:] = torch.tensor([0.0, 1.0])
+        next_observations = torch.randn(8, 6)
+        next_observations[:, -2:] = torch.tensor([0.0, 1.0])
+        agent.update_batch(
+            observations=observations,
+            actions=torch.tanh(torch.randn(8, 2)),
+            rewards=torch.randn(8, 1),
+            next_observations=next_observations,
+            dones=torch.zeros(8, 1),
+        )
+
+        self.assertEqual(agent.background_critic_updates, 0)
+        self.assertTrue(
+            any(
+                not torch.equal(pre_task_transfer[name], value)
+                for name, value in agent.critic1.state_dict().items()
+            )
+        )
+        for name, value in agent._transfer_critic1.state_dict().items():
+            torch.testing.assert_close(value, pre_task_transfer[name])
+
+        agent.on_task_end(task_index=1, replay_buffer=object(), batch_size=8)
+        for name, value in agent.critic1.state_dict().items():
+            torch.testing.assert_close(value, pre_task_transfer[name])
 
     def test_conflict_lora_uses_separate_optimizer(self) -> None:
         agent = ConflictLoRAFullBCAgent(

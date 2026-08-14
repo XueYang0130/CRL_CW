@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "source": "offline_gpt5mini_schema_plus_frozen_compositional_rule",
+  "rule": "Reset only for a novel tool-mediated control structure; otherwise transfer.",
+  "routes": [
+    {"task_index": 0, "task_name": "hammer-v3", "route": "transfer", "reason": "First task establishes the persistent critic."},
+    {"task_index": 1, "task_name": "push-wall-v3", "route": "transfer", "reason": "Direct object manipulation reuses prior contact-control structure."},
+    {"task_index": 2, "task_name": "faucet-close-v3", "route": "transfer", "reason": "Direct constrained manipulation does not introduce tool mediation."},
+    {"task_index": 3, "task_name": "push-back-v3", "route": "transfer", "reason": "Direct object manipulation reuses prior contact-control structure."},
+    {"task_index": 4, "task_name": "stick-pull-v3", "route": "reset", "reason": "First novel tool-mediated chain: grasp tool, align tool-object contact, then pull indirectly."},
+    {"task_index": 5, "task_name": "handle-press-side-v3", "route": "transfer", "reason": "Direct constrained manipulation reuses learned contact control."},
+    {"task_index": 6, "task_name": "push-v3", "route": "transfer", "reason": "Direct planar object manipulation reuses prior value structure."},
+    {"task_index": 7, "task_name": "shelf-place-v3", "route": "transfer", "reason": "Grasp-and-place composition does not require an intermediate tool."},
+    {"task_index": 8, "task_name": "window-close-v3", "route": "transfer", "reason": "Direct constrained manipulation reuses learned contact control."},
+    {"task_index": 9, "task_name": "peg-unplug-side-v3", "route": "transfer", "reason": "Direct grasped-object extraction reuses grasp and constrained-motion structure."}
+  ]
+}

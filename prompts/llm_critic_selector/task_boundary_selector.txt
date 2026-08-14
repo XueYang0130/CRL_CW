@@ -1,0 +1,40 @@
+You are selecting critic initialization for continual reinforcement learning.
+
+At each new task, choose exactly one option:
+- "transfer": retain the persistent twin-Q critic trained continuously on all earlier tasks.
+- "reset": use a freshly initialized twin-Q critic for actor guidance on this task.
+
+The persistent transfer critic continues learning on every task regardless of the choice. A
+reset critic is temporary and is discarded after its task. Actor parameters, actor behavior-
+cloning memory, and the task-conditioned multi-head architecture are unchanged.
+
+Make each decision using ONLY the ordered task descriptions below. Do not assume access to
+training curves, success rates, returns, task-specific experimental results, or a known answer.
+State similarity alone is insufficient: focus on whether the action-to-return/value structure,
+interaction mode, contact topology, stage dependency, and required control behavior are likely
+to transfer from the previously learned tasks. Prefer transfer when evidence is weak; choose
+reset only when there is a clear qualitative value-structure shift.
+
+Protocol:
+$protocol
+
+Ordered task profiles:
+$task_profiles
+
+Return exactly one JSON object with this schema and no markdown:
+{
+  "decisions": [
+    {
+      "task_index": 1,
+      "task_name": "push-wall-v3",
+      "decision": "transfer",
+      "confidence": 0.0,
+      "value_structure_shift": "low|medium|high",
+      "reason": "one concise sentence"
+    }
+  ],
+  "global_rationale": "one concise sentence"
+}
+
+Include exactly one decision for every task after task 0, in the supplied order. Confidence must
+be between 0 and 1. Task 0 has no decision because both critics begin from fresh initialization.

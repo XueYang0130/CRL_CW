@@ -14,6 +14,12 @@ from methods.stage_aware_semantic_bc import METHOD as STAGE_AWARE_SEMANTIC_BC
 from methods.success_replay_best_adaptive_pcgrad import (
     METHOD as SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
 )
+from methods.semantic_routed_dual_critic_pcgrad import (
+    METHOD as SEMANTIC_ROUTED_DUAL_CRITIC_PCGRAD,
+)
+from methods.semantic_routed_frozen_transfer_pcgrad import (
+    METHOD as SEMANTIC_ROUTED_FROZEN_TRANSFER_PCGRAD,
+)
 from methods.success_replay_best_random_broader_adaptive_pcgrad import (
     METHOD as SUCCESS_REPLAY_BEST_RANDOM_BROADER_ADAPTIVE_PCGRAD,
 )
@@ -62,6 +68,8 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
         SUCCESS_REPLAY_BEST,
         SUCCESS_REPLAY_BEST_PCGRAD,
         SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
+        SEMANTIC_ROUTED_DUAL_CRITIC_PCGRAD,
+        SEMANTIC_ROUTED_FROZEN_TRANSFER_PCGRAD,
         SUCCESS_REPLAY_BEST_RANDOM_BROADER_ADAPTIVE_PCGRAD,
         SUCCESS_REPLAY_BEST_LLM_BROADER_ADAPTIVE_PCGRAD,
         SUCCESS_REPLAY_BEST_CAGRAD,
@@ -85,6 +93,8 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
     "success_replay_best": "standard",
     "success_replay_best_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_adaptive_pcgrad": "pcgrad_sac_priority",
+    "semantic_routed_dual_critic_pcgrad": "pcgrad_sac_priority",
+    "semantic_routed_frozen_transfer_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_random_broader_adaptive_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_llm_broader_adaptive_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_cagrad": "standard",
@@ -96,6 +106,8 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
 
 BC_COMBINATION_STRATEGY_BY_METHOD = {
     "success_replay_best_adaptive_pcgrad": "adaptive_additive",
+    "semantic_routed_dual_critic_pcgrad": "adaptive_additive",
+    "semantic_routed_frozen_transfer_pcgrad": "adaptive_additive",
     "success_replay_best_random_broader_adaptive_pcgrad": "adaptive_additive",
     "success_replay_best_llm_broader_adaptive_pcgrad": "adaptive_additive",
     "success_replay_best_progress_pcgrad": "adaptive_additive",

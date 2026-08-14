@@ -1,0 +1,43 @@
+You are a robotics task-schema extractor. Convert the ordered manipulation task profiles into
+the fixed schema below. Do not recommend critic transfer or reset. Do not output confidence,
+similarity, novelty, value shift, or any experimental prediction.
+
+Use only the supplied static, pre-training information. Use the same vocabulary consistently
+across tasks. `stage_dependencies` contains directed prerequisite edges [earlier, later].
+`structural_relations` describes physical control relations and must use short canonical forms,
+for example: gripper-grasps-object, gripper-contacts-object, gripper-grasps-tool,
+tool-contacts-object, tool-controls-object, object-moves-to-goal.
+
+Allowed values:
+- controlled_entity: object, articulated_part, tool, tool_mediated_object
+- contact_relation: direct, grasped, tool_mediated
+- motion_constraint: free_3d, planar, linear_axis, rotational_axis
+- action primitives: reach, contact, grasp, lift, align, push, pull, rotate, press, slide,
+  place, release, stabilize
+
+Canonicalization is mandatory: represent extraction or unplugging as "pull"; represent insertion
+or engagement as "align" followed by "contact". Never invent a primitive outside this list.
+
+Protocol:
+$protocol
+
+Ordered task profiles:
+$task_profiles
+
+Return exactly one JSON object and no markdown:
+{
+  "schemas": [
+    {
+      "task_index": 0,
+      "task_name": "hammer-v3",
+      "controlled_entity": "tool_mediated_object",
+      "contact_relation": "tool_mediated",
+      "motion_constraint": "free_3d",
+      "action_primitives": ["reach"],
+      "stage_dependencies": [["reach", "contact"]],
+      "structural_relations": ["gripper-contacts-object"]
+    }
+  ]
+}
+
+Include all ten tasks exactly once in the supplied order. Do not add fields.
