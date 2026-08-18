@@ -16,6 +16,7 @@ if str(SRC_DIR) not in sys.path:
 
 from agents import (
     DEFAULT_HIDDEN_SIZES,
+    DeepHeadQCritic,
     LOG_STD_MAX,
     LOG_STD_MIN,
     GaussianActor,
@@ -145,6 +146,62 @@ class TestSACNetworks(unittest.TestCase):
         )
 
         self.assertEqual(q_values.shape, (8, 1))
+
+    def test_deep_head_critic_preserves_backbone_and_routes_mixed_batch(self) -> None:
+        critic = DeepHeadQCritic(
+            observation_dim=8,
+            action_dim=2,
+            task_id_dim=3,
+            num_heads=3,
+            hide_task_id=True,
+            head_hidden_size=64,
+        )
+        self.assertEqual(len(critic.backbone.hidden_layers), 4)
+        self.assertEqual(len(critic.q_heads), 3)
+        for head in critic.q_heads:
+            self.assertEqual(head[0].in_features, 256)
+            self.assertEqual(head[0].out_features, 64)
+            self.assertEqual(head[2].in_features, 64)
+            self.assertEqual(head[2].out_features, 1)
+
+        observations = torch.randn(6, 8)
+        task_indices = torch.tensor([0, 1, 0, 1, 0, 1])
+        observations[:, -3:] = torch.nn.functional.one_hot(
+            task_indices,
+            num_classes=3,
+        ).float()
+        actions = torch.randn(6, 2)
+        q_values = critic(observations, actions)
+        self.assertEqual(q_values.shape, (6, 1))
+
+        q_values.sum().backward()
+        self.assertTrue(
+            any(parameter.grad is not None for parameter in critic.backbone.parameters())
+        )
+        for task_index in (0, 1):
+            self.assertTrue(
+                any(
+                    parameter.grad is not None
+                    for parameter in critic.q_heads[task_index].parameters()
+                )
+            )
+        self.assertTrue(
+            all(
+                parameter.grad is not None
+                and torch.count_nonzero(parameter.grad).item() == 0
+                for parameter in critic.q_heads[2].parameters()
+            )
+        )
+
+    def test_deep_head_critic_rejects_invalid_head_width(self) -> None:
+        with self.assertRaisesRegex(ValueError, "head_hidden_size"):
+            DeepHeadQCritic(
+                observation_dim=8,
+                action_dim=2,
+                task_id_dim=3,
+                num_heads=3,
+                head_hidden_size=0,
+            )
 
     def test_actor_reparameterization_supports_gradients(self) -> None:
         observations = torch.randn(

@@ -2,7 +2,7 @@ import unittest
 
 import numpy as np
 
-from training.continual_experiment import build_hybrid_memory_from_store
+from training.continual_experiment_copy import build_hybrid_memory_from_store
 from training.semantic_segments import SEGMENT_ORDER
 
 

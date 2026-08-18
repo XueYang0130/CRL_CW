@@ -9,7 +9,7 @@ from .single_task_experiment import (
     SINGLE_TASK_EVAL_FIELDS,
     run_single_task_experiment,
 )
-from .continual_experiment import (
+from .continual_experiment_copy import (
     CW10_EVAL_FIELDS,
     CW10_TASK_SUMMARY_FIELDS,
     run_cw10_experiment,

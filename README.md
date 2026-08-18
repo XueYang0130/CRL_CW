@@ -64,6 +64,10 @@ contains experiment evidence and can be large.
 - `semantic_local_bc`: static semantic memory using selected general segments.
 - `semantic_hybrid_bc`: general, background, and task-specific semantic memory,
   with optional online LLM control of the general segment weights.
+- `ssde`: SSDE mechanism reproduction with Sentence-BERT task descriptors,
+  fixed-plus-random sparse actor gates, overlap scaling, task-start random-policy
+  distillation, critic reset, and input-sensitivity dormant-unit reactivation.
+- `ssde_approx`: retained lightweight diagnostic only; do not report it as SSDE.
 
 `gradient-aware BC` is an experimental diagnostic path in the stick-pull probe
 script. It is default-off and is not part of the formal baseline set.

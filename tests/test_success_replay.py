@@ -5,6 +5,8 @@ import torch
 
 from agents import (
     ConflictLoRAFullBCAgent,
+    DeepHeadCriticFullBCAgent,
+    DeepHeadQCritic,
     FullBehaviorCloningSACAgent,
     SemanticRoutedDualCriticAgent,
     SemanticRoutedFrozenTransferCriticAgent,
@@ -75,6 +77,33 @@ class SuccessfulStateReservoirTests(unittest.TestCase):
         self.assertEqual(first.observations().shape, (5, 2))
         np.testing.assert_array_equal(first.observations(), second.observations())
 
+    def test_can_deterministically_subsample_for_dynamic_memory_mix(self) -> None:
+        episode = tuple(
+            np.array([float(index), float(index + 1)], dtype=np.float32)
+            for index in range(10)
+        )
+        memory = SuccessfulStateReservoir(capacity=10, observation_dim=2, seed=3)
+        memory.add_episode(episode, True)
+
+        first = memory.observations(capacity=4, seed=19)
+        second = memory.observations(capacity=4, seed=19)
+
+        self.assertEqual(first.shape, (4, 2))
+        np.testing.assert_array_equal(first, second)
+
+    def test_subsampling_requires_seed_only_when_needed(self) -> None:
+        memory = SuccessfulStateReservoir(capacity=3, observation_dim=1, seed=0)
+        memory.add_episode(
+            tuple(
+                np.array([float(index)], dtype=np.float32)
+                for index in range(3)
+            ),
+            True,
+        )
+        self.assertEqual(memory.observations(capacity=3).shape, (3, 1))
+        with self.assertRaisesRegex(ValueError, "seed"):
+            memory.observations(capacity=2)
+
     def test_rejects_invalid_observation_shape(self) -> None:
         memory = SuccessfulStateReservoir(capacity=2, observation_dim=3, seed=0)
         with self.assertRaisesRegex(ValueError, "expected"):
@@ -109,11 +138,19 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
                 "best",
                 "pcgrad_sac_priority",
             ),
+            "success_replay_best_adaptive_pcgrad_deep_critic_heads": (
+                "best",
+                "pcgrad_sac_priority",
+            ),
             "semantic_routed_dual_critic_pcgrad": (
                 "best",
                 "pcgrad_sac_priority",
             ),
             "semantic_routed_frozen_transfer_pcgrad": (
+                "best",
+                "pcgrad_sac_priority",
+            ),
+            "semantic_routed_frozen_transfer_mixed80_pcgrad": (
                 "best",
                 "pcgrad_sac_priority",
             ),
@@ -150,8 +187,10 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
                 self.assertEqual(method.defaults["episodic_memory_per_task"], 10_000)
                 if method_id in {
                     "success_replay_best_adaptive_pcgrad",
+                    "success_replay_best_adaptive_pcgrad_deep_critic_heads",
                     "semantic_routed_dual_critic_pcgrad",
                     "semantic_routed_frozen_transfer_pcgrad",
+                    "semantic_routed_frozen_transfer_mixed80_pcgrad",
                     "success_replay_best_random_broader_adaptive_pcgrad",
                     "success_replay_best_llm_broader_adaptive_pcgrad",
                 }:
@@ -159,7 +198,7 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
                         method.defaults["bc_combination_strategy"],
                         "adaptive_additive",
                     )
-                if "broader" in method_id:
+                if "broader" in method_id or "mixed80" in method_id:
                     self.assertEqual(method.broader_replay_ratio, 0.2)
                     self.assertEqual(
                         method.broader_replay_selector,
@@ -181,6 +220,76 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
                     self.assertTrue(method.defaults["bc_progress_gate"])
                 if method_id == "success_replay_best_llm_schedule_pcgrad":
                     self.assertTrue(method.defaults["llm_task_bc_schedule"])
+
+    def test_deep_critic_head_method_builds_and_resets_deep_critics(self) -> None:
+        agent = DeepHeadCriticFullBCAgent(
+            observation_dim=6,
+            action_dim=2,
+            action_low=np.full(2, -1.0, dtype=np.float32),
+            action_high=np.full(2, 1.0, dtype=np.float32),
+            num_tasks=2,
+            task_id_dim=2,
+            hide_task_id=True,
+            device="cpu",
+            episodic_batch_size=2,
+            actor_cloning_coefficient=100.0,
+            bc_gradient_strategy="pcgrad_sac_priority",
+            bc_combination_strategy="adaptive_additive",
+            critic_head_hidden_size=64,
+        )
+        for critic in (
+            agent.critic1,
+            agent.critic2,
+            agent.target_critic1,
+            agent.target_critic2,
+        ):
+            self.assertIsInstance(critic, DeepHeadQCritic)
+            self.assertEqual(critic.head_hidden_size, 64)
+
+        before_reset = next(agent.critic1.parameters()).detach().clone()
+        agent.reset_critics()
+        self.assertIsInstance(agent.critic1, DeepHeadQCritic)
+        self.assertFalse(torch.equal(before_reset, next(agent.critic1.parameters())))
+        for online, target in zip(
+            agent.critic1.parameters(),
+            agent.target_critic1.parameters(),
+        ):
+            torch.testing.assert_close(online, target)
+            self.assertFalse(target.requires_grad)
+
+        inactive_before = tuple(
+            parameter.detach().clone()
+            for parameter in agent.critic1.q_heads[0].parameters()
+        )
+        active_before = tuple(
+            parameter.detach().clone()
+            for parameter in agent.critic1.q_heads[1].parameters()
+        )
+        observations = torch.randn(8, 6)
+        observations[:, -2:] = torch.tensor([0.0, 1.0])
+        next_observations = torch.randn(8, 6)
+        next_observations[:, -2:] = torch.tensor([0.0, 1.0])
+        agent.update_batch(
+            observations=observations,
+            actions=torch.tanh(torch.randn(8, 2)),
+            rewards=torch.randn(8, 1),
+            next_observations=next_observations,
+            dones=torch.zeros(8, 1),
+        )
+        for before, after in zip(
+            inactive_before,
+            agent.critic1.q_heads[0].parameters(),
+        ):
+            torch.testing.assert_close(before, after)
+        self.assertTrue(
+            any(
+                not torch.equal(before, after)
+                for before, after in zip(
+                    active_before,
+                    agent.critic1.q_heads[1].parameters(),
+                )
+            )
+        )
 
 
 class SemanticRoutedDualCriticTests(unittest.TestCase):

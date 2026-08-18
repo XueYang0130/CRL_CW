@@ -511,3 +511,114 @@ class QCritic(nn.Module):
             q_values = all_q_values
 
         return q_values
+
+
+class DeepHeadQCritic(nn.Module):
+    """Multi-head Q-function with a nonlinear tower for each task."""
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        hidden_sizes: Sequence[int] = DEFAULT_HIDDEN_SIZES,
+        head_hidden_size: int = 64,
+        use_layer_norm: bool = True,
+        task_id_dim: int = 0,
+        num_heads: int = 1,
+        hide_task_id: bool = False,
+    ) -> None:
+        super().__init__()
+        if observation_dim <= 0:
+            raise ValueError("observation_dim must be positive.")
+        if action_dim <= 0:
+            raise ValueError("action_dim must be positive.")
+        if head_hidden_size <= 0:
+            raise ValueError("head_hidden_size must be positive.")
+        if task_id_dim < 0 or task_id_dim >= observation_dim:
+            raise ValueError("task_id_dim must be in [0, observation_dim).")
+        if num_heads <= 0:
+            raise ValueError("num_heads must be positive.")
+        if num_heads > 1 and task_id_dim != num_heads:
+            raise ValueError(
+                "For multi-head critic, task_id_dim must equal num_heads."
+            )
+
+        self.observation_dim = int(observation_dim)
+        self.action_dim = int(action_dim)
+        self.task_id_dim = int(task_id_dim)
+        self.num_heads = int(num_heads)
+        self.hide_task_id = bool(hide_task_id)
+        self.head_hidden_size = int(head_hidden_size)
+        backbone_observation_dim = (
+            self.observation_dim - self.task_id_dim
+            if self.hide_task_id
+            else self.observation_dim
+        )
+        self.backbone = SharedMLP(
+            input_dim=backbone_observation_dim + self.action_dim,
+            hidden_sizes=hidden_sizes,
+            use_layer_norm=use_layer_norm,
+        )
+        self.q_heads = nn.ModuleList(
+            self._make_head(self.backbone.output_dim) for _ in range(self.num_heads)
+        )
+
+    def _make_head(self, input_dim: int) -> nn.Sequential:
+        hidden = nn.Linear(input_dim, self.head_hidden_size)
+        output = nn.Linear(self.head_hidden_size, 1)
+        initialize_linear_layer(hidden)
+        initialize_linear_layer(output)
+        return nn.Sequential(hidden, nn.LeakyReLU(LEAKY_RELU_SLOPE), output)
+
+    def forward(
+        self,
+        observations: torch.Tensor,
+        actions: torch.Tensor,
+    ) -> torch.Tensor:
+        if observations.ndim != 2:
+            raise ValueError("observations must be a rank-2 tensor.")
+        if actions.ndim != 2:
+            raise ValueError("actions must be a rank-2 tensor.")
+        if observations.shape[0] != actions.shape[0]:
+            raise ValueError("observations and actions must have the same batch size.")
+        if observations.shape[-1] != self.observation_dim:
+            raise ValueError(
+                f"Expected observation dimension {self.observation_dim}, "
+                f"received {observations.shape[-1]}."
+            )
+        if actions.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Expected action dimension {self.action_dim}, "
+                f"received {actions.shape[-1]}."
+            )
+
+        if self.task_id_dim == 0:
+            backbone_observations = observations
+            task_indices = torch.zeros(
+                observations.shape[0], dtype=torch.long, device=observations.device
+            )
+        else:
+            task_one_hot = observations[:, -self.task_id_dim:]
+            backbone_observations = (
+                observations[:, :-self.task_id_dim]
+                if self.hide_task_id
+                else observations
+            )
+            task_indices = task_one_hot.argmax(dim=1)
+
+        features = self.backbone(torch.cat((backbone_observations, actions), dim=-1))
+        q_values = features.new_zeros((features.shape[0], 1))
+        # Continual replay batches normally contain one task. Grouped dispatch also
+        # keeps mixed-task batches correct without evaluating every task tower.
+        for task_index_tensor in task_indices.unique():
+            task_index = int(task_index_tensor.item())
+            mask = task_indices == task_index_tensor
+            q_values[mask] = self.q_heads[task_index](features[mask])
+
+        # SAC requests gradients for every critic parameter in one call. Keep
+        # inactive towers in that graph with exactly zero gradients, without
+        # paying for their forward passes.
+        zero_gradient_anchor = features.new_zeros(())
+        for parameter in self.q_heads.parameters():
+            zero_gradient_anchor = zero_gradient_anchor + parameter.reshape(-1)[0]
+        return q_values + zero_gradient_anchor * 0.0

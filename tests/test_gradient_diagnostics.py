@@ -20,6 +20,7 @@ def make_agent(
     adaptive_target_ratio: float = 0.2,
     adaptive_conflict_ratio: float = 0.05,
     cagrad_alpha: float = 0.5,
+    bc_update_interval: int = 1,
 ) -> FullBehaviorCloningSACAgent:
     return FullBehaviorCloningSACAgent(
         observation_dim=6,
@@ -38,6 +39,7 @@ def make_agent(
         bc_adaptive_target_ratio=adaptive_target_ratio,
         bc_adaptive_conflict_ratio=adaptive_conflict_ratio,
         bc_cagrad_alpha=cagrad_alpha,
+        bc_update_interval=bc_update_interval,
         gradient_diagnostics=diagnostics,
         gradient_diagnostics_interval=diagnostics_interval,
         gradient_diagnostics_source_batch_size=4,
@@ -583,6 +585,53 @@ class TestGradientDiagnostics(unittest.TestCase):
                 rtol=0.0,
                 atol=0.0,
             )
+
+    def test_sparse_bc_applies_only_on_configured_actor_updates(self) -> None:
+        agent = make_agent(
+            diagnostics=False,
+            gradient_strategy="standard",
+            bc_update_interval=4,
+        )
+        self.add_task_zero_memory(agent)
+        parameters = tuple(agent.actor.parameters())
+        sac_gradients = tuple(torch.randn_like(parameter) for parameter in parameters)
+
+        for _ in range(3):
+            actual = agent.adjust_actor_gradients(
+                gradients=sac_gradients,
+                parameters=parameters,
+                task_index=1,
+            )
+            for expected_gradient, actual_gradient in zip(
+                sac_gradients, actual, strict=True
+            ):
+                torch.testing.assert_close(actual_gradient, expected_gradient)
+
+        fourth = agent.adjust_actor_gradients(
+            gradients=sac_gradients,
+            parameters=parameters,
+            task_index=1,
+        )
+        self.assertEqual(agent.bc_update_opportunities, 4)
+        self.assertEqual(agent.bc_updates_applied, 1)
+        self.assertTrue(
+            any(
+                not torch.equal(actual_gradient, expected_gradient)
+                for actual_gradient, expected_gradient in zip(
+                    fourth, sac_gradients, strict=True
+                )
+            )
+        )
+
+        agent.on_task_start(task_index=2, replay_buffer=object())
+        self.assertEqual(agent.bc_update_opportunities, 0)
+        self.assertEqual(agent.bc_updates_applied, 0)
+
+    def test_bc_update_interval_rejects_invalid_values(self) -> None:
+        agent = make_agent(diagnostics=False)
+        for interval in (0, -1, True, 1.5):
+            with self.subTest(interval=interval), self.assertRaises(ValueError):
+                agent.configure_bc_update_interval(interval)  # type: ignore[arg-type]
 
     def test_zero_progress_multiplier_preserves_full_sac_gradient(self) -> None:
         agent = make_agent(diagnostics=True)

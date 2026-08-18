@@ -100,52 +100,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--reset-buffer-on-task-change", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reset-optimizer-on-task-change", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--reset-critic-on-task-change", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument(
-        "--critic-reset-task-indices",
-        type=int,
-        nargs="*",
-        default=None,
-        help=(
-            "Optional task indices that should reset critics at task start. "
-            "If provided, only these tasks reset and all other tasks keep transferred critics."
-        ),
-    )
-    parser.add_argument("--adaptive-critic-init", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--critic-probe-transitions", type=int, default=5000)
-    parser.add_argument("--critic-warmup-updates", type=int, default=500)
-    parser.add_argument("--critic-route-manifest", type=str, default=None)
-    parser.add_argument("--critic-head-hidden-size", type=int, default=64)
     parser.add_argument("--baseline-curves", type=str, default=None)
-    parser.add_argument("--cl-reg-coef", type=float, default=1_000.0)
-    parser.add_argument("--fisher-batches", type=int, default=10)
     parser.add_argument("--packnet-retrain-steps", type=int, default=0)
-    parser.add_argument("--ssde-dormancy-threshold", type=float, default=0.01)
-    parser.add_argument("--ssde-dormancy-check-every", type=int, default=10_000)
-    parser.add_argument("--ssde-retrain-steps", type=int, default=0)
-    parser.add_argument("--ssde-hidden-size", type=int, default=1024)
-    parser.add_argument("--ssde-descriptor-dim", type=int, default=384)
-    parser.add_argument("--ssde-fixed-lasso-alpha", type=float, default=0.01)
-    parser.add_argument("--ssde-random-lasso-alpha-start", type=float, default=0.01)
-    parser.add_argument("--ssde-random-lasso-alpha-end", type=float, default=0.0001)
-    parser.add_argument("--ssde-default-beta", type=float, default=0.3)
-    parser.add_argument(
-        "--ssde-adaptive-beta",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument("--ssde-beta-lambda", type=float, default=0.5)
-    parser.add_argument("--ssde-sensitivity-interval", type=int, default=80_000)
-    parser.add_argument("--ssde-sensitivity-batch-size", type=int, default=1_000)
-    parser.add_argument("--ssde-sensitivity-threshold", type=float, default=0.6)
-    parser.add_argument("--ssde-stop-reset-after-steps", type=int, default=650_000)
-    parser.add_argument("--ssde-target-entropy", type=float, default=-2.0)
-    parser.add_argument(
-        "--ssde-random-distillation",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--ssde-distillation-steps", type=int, default=20_000)
     parser.add_argument("--episodic-memory-per-task", type=int, default=0)
     parser.add_argument("--episodic-batch-size", type=int, default=0)
     parser.add_argument("--actor-cloning-coefficient", type=float, default=0.0)
@@ -505,65 +461,6 @@ def parse_args() -> argparse.Namespace:
         )
     if args.best_return_eval_episodes <= 0:
         parser.error("--best-return-eval-episodes must be positive.")
-    if args.adaptive_critic_init and args.reset_critic_on_task_change:
-        parser.error(
-            "--adaptive-critic-init and --reset-critic-on-task-change are "
-            "mutually exclusive."
-        )
-    if args.adaptive_critic_init and args.critic_reset_task_indices:
-        parser.error(
-            "--adaptive-critic-init and --critic-reset-task-indices are "
-            "mutually exclusive."
-        )
-    if args.critic_probe_transitions <= 0:
-        parser.error("--critic-probe-transitions must be positive.")
-    if args.critic_warmup_updates <= 0:
-        parser.error("--critic-warmup-updates must be positive.")
-    if args.critic_head_hidden_size <= 0:
-        parser.error("--critic-head-hidden-size must be positive.")
-    if not math.isfinite(args.cl_reg_coef) or args.cl_reg_coef < 0.0:
-        parser.error("--cl-reg-coef must be finite and non-negative.")
-    if args.fisher_batches <= 0:
-        parser.error("--fisher-batches must be positive.")
-    if args.packnet_retrain_steps < 0:
-        parser.error("--packnet-retrain-steps must be non-negative.")
-    if (
-        not math.isfinite(args.ssde_dormancy_threshold)
-        or args.ssde_dormancy_threshold < 0.0
-    ):
-        parser.error(
-            "--ssde-dormancy-threshold must be finite and non-negative."
-        )
-    if args.ssde_dormancy_check_every <= 0:
-        parser.error("--ssde-dormancy-check-every must be positive.")
-    if args.ssde_retrain_steps < 0:
-        parser.error("--ssde-retrain-steps must be non-negative.")
-    if args.ssde_hidden_size <= 0 or args.ssde_descriptor_dim <= 0:
-        parser.error("SSDE hidden and descriptor dimensions must be positive.")
-    for name in (
-        "ssde_fixed_lasso_alpha",
-        "ssde_random_lasso_alpha_start",
-        "ssde_random_lasso_alpha_end",
-        "ssde_beta_lambda",
-        "ssde_sensitivity_threshold",
-    ):
-        value = getattr(args, name)
-        if not math.isfinite(value) or value <= 0.0:
-            parser.error(f"--{name.replace('_', '-')} must be finite and positive.")
-    if not math.isfinite(args.ssde_default_beta) or not 0.0 <= args.ssde_default_beta <= 1.0:
-        parser.error("--ssde-default-beta must lie in [0, 1].")
-    if args.ssde_sensitivity_interval <= 0 or args.ssde_sensitivity_batch_size <= 0:
-        parser.error("SSDE sensitivity interval and batch size must be positive.")
-    if args.ssde_stop_reset_after_steps <= 0:
-        parser.error("--ssde-stop-reset-after-steps must be positive.")
-    if not math.isfinite(args.ssde_target_entropy):
-        parser.error("--ssde-target-entropy must be finite.")
-    if args.ssde_distillation_steps < 0:
-        parser.error("--ssde-distillation-steps must be non-negative.")
-    if args.critic_reset_task_indices is not None:
-        for index in args.critic_reset_task_indices:
-            if index < 0:
-                parser.error("--critic-reset-task-indices must be non-negative.")
     if args.full_bc_reference_episodes <= 0:
         parser.error("--full-bc-reference-episodes must be positive.")
     if args.full_bc_reference_max_attempts < args.full_bc_reference_episodes:
@@ -883,17 +780,13 @@ def run_continual(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    wall_start = time.time()
     if args.mode == "single":
         run_single(args)
-    elif args.mode == "single-batch":
+        return
+    if args.mode == "single-batch":
         run_single_batch(args)
-    else:
-        run_continual(args)
-    elapsed = time.time() - wall_start
-    hours, remainder = divmod(int(elapsed), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    print(f"Total wall-clock time: {hours}h {minutes}m {seconds}s ({elapsed:.1f}s)")
+        return
+    run_continual(args)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 import unittest
 
-from training.continual_experiment import validate_baseline_curves_for_run
+from training.continual_experiment_copy import validate_baseline_curves_for_run
 
 
 class TestContinualRunValidation(unittest.TestCase):

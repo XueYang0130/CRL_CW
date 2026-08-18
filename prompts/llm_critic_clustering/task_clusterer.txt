@@ -1,0 +1,31 @@
+You are a robotics value-function structure analyst. Cluster the ten ordered manipulation
+tasks into critic-transfer families using only the supplied static, pre-training information.
+Tasks in one family should plausibly share reward-to-go topology, contact dynamics, motion
+constraints, and stage dependencies. Tasks in different families should have sufficiently
+different value structure that blindly continuing one critic may cause negative transfer.
+
+Do not use experimental outcomes, task order as evidence, or method-specific performance.
+Do not recommend per-task hyperparameters. Use between 2 and 6 non-empty clusters. Assign
+every task exactly once. Prefer the smallest number of clusters that preserves meaningful
+within-cluster critic transfer. A cluster may contain one task when its value structure is
+genuinely unmatched.
+
+Protocol:
+$protocol
+
+Ordered task profiles:
+$task_profiles
+
+Return exactly one JSON object and no markdown:
+{
+  "clusters": [
+    {
+      "cluster_name": "short_canonical_name",
+      "task_indices": [0, 4],
+      "task_names": ["hammer-v3", "stick-pull-v3"],
+      "shared_value_structure": "one concise explanation",
+      "separation_reason": "one concise explanation of why this family should not blindly share a critic with the other families"
+    }
+  ],
+  "global_rationale": "one concise explanation"
+}

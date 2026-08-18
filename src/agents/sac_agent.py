@@ -91,21 +91,8 @@ class SACAgent(nn.Module):
             hide_task_id=self.hide_task_id,
         ).to(resolved_device)
 
-        self.critic1 = QCritic(
-            observation_dim=self.observation_dim,
-            action_dim=self.action_dim,
-            task_id_dim=self.task_id_dim,
-            num_heads=self.num_tasks,
-            hide_task_id=self.hide_task_id,
-        ).to(resolved_device)
-
-        self.critic2 = QCritic(
-            observation_dim=self.observation_dim,
-            action_dim=self.action_dim,
-            task_id_dim=self.task_id_dim,
-            num_heads=self.num_tasks,
-            hide_task_id=self.hide_task_id,
-        ).to(resolved_device)
+        self.critic1 = self._make_critic().to(resolved_device)
+        self.critic2 = self._make_critic().to(resolved_device)
 
         if self.actor.num_heads != self.num_tasks:
             raise RuntimeError(
@@ -183,20 +170,8 @@ class SACAgent(nn.Module):
 
     def reset_critics(self) -> None:
         """Reset online and target critics to fresh initializations."""
-        fresh_critic1 = QCritic(
-            observation_dim=self.observation_dim,
-            action_dim=self.action_dim,
-            task_id_dim=self.task_id_dim,
-            num_heads=self.num_tasks,
-            hide_task_id=self.hide_task_id,
-        ).to(self.device)
-        fresh_critic2 = QCritic(
-            observation_dim=self.observation_dim,
-            action_dim=self.action_dim,
-            task_id_dim=self.task_id_dim,
-            num_heads=self.num_tasks,
-            hide_task_id=self.hide_task_id,
-        ).to(self.device)
+        fresh_critic1 = self._make_critic().to(self.device)
+        fresh_critic2 = self._make_critic().to(self.device)
         self.critic1.load_state_dict(
             fresh_critic1.state_dict(),
             strict=True,
@@ -214,6 +189,16 @@ class SACAgent(nn.Module):
             strict=True,
         )
         self._freeze_target_critics()
+
+    def _make_critic(self) -> nn.Module:
+        """Construct one critic, allowing isolated methods to replace its head."""
+        return QCritic(
+            observation_dim=self.observation_dim,
+            action_dim=self.action_dim,
+            task_id_dim=self.task_id_dim,
+            num_heads=self.num_tasks,
+            hide_task_id=self.hide_task_id,
+        )
 
     @property
     def device(self) -> torch.device:
@@ -590,8 +575,21 @@ class SACAgent(nn.Module):
     ) -> None:
         del task_index, replay_buffer
 
+    def on_environment_transition(
+        self,
+        *,
+        observation: np.ndarray,
+        next_observation: np.ndarray,
+    ) -> None:
+        """Observe one transition without modifying the training replay path."""
+        del observation, next_observation
+
     def on_evaluation_start(self, task_index: int) -> None:
         del task_index
+
+    def task_diagnostics(self) -> dict[str, float | int | None]:
+        """Return method-specific values for the current task summary."""
+        return {}
 
     def on_evaluation_end(self, task_index: int) -> None:
         del task_index

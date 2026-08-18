@@ -22,6 +22,7 @@ class FullBehaviorCloningSACAgent(SACAgent):
         bc_combination_strategy: str = "average",
         bc_adaptive_target_ratio: float = 0.2,
         bc_adaptive_conflict_ratio: float = 0.05,
+        bc_update_interval: int = 1,
         bc_cagrad_alpha: float = 0.5,
         gradient_diagnostics: bool = False,
         gradient_diagnostics_interval: int = 500,
@@ -79,6 +80,12 @@ class FullBehaviorCloningSACAgent(SACAgent):
                 "bc_adaptive_conflict_ratio cannot exceed "
                 "bc_adaptive_target_ratio."
             )
+        if (
+            isinstance(bc_update_interval, bool)
+            or not isinstance(bc_update_interval, int)
+            or bc_update_interval <= 0
+        ):
+            raise ValueError("bc_update_interval must be a positive integer.")
         if not math.isfinite(bc_cagrad_alpha) or not 0.0 <= bc_cagrad_alpha < 1.0:
             raise ValueError("bc_cagrad_alpha must be finite and in [0, 1).")
 
@@ -89,6 +96,9 @@ class FullBehaviorCloningSACAgent(SACAgent):
         self.bc_combination_strategy = bc_combination_strategy
         self.bc_adaptive_target_ratio = float(bc_adaptive_target_ratio)
         self.bc_adaptive_conflict_ratio = float(bc_adaptive_conflict_ratio)
+        self.bc_update_interval = int(bc_update_interval)
+        self.bc_update_opportunities = 0
+        self.bc_updates_applied = 0
         self.bc_cagrad_alpha = float(bc_cagrad_alpha)
         self.bc_progress_multiplier = 1.0
         self.gradient_aware_bc = False
@@ -110,6 +120,18 @@ class FullBehaviorCloningSACAgent(SACAgent):
             gradient_clip_norm=self.gradient_clip_norm,
             seed=gradient_diagnostics_seed,
         )
+
+    def configure_bc_update_interval(self, interval: int) -> None:
+        if isinstance(interval, bool) or not isinstance(interval, int) or interval <= 0:
+            raise ValueError("BC update interval must be a positive integer.")
+        self.bc_update_interval = int(interval)
+        self.bc_update_opportunities = 0
+        self.bc_updates_applied = 0
+
+    def on_task_start(self, *, task_index: int, replay_buffer: object) -> None:
+        super().on_task_start(task_index=task_index, replay_buffer=replay_buffer)
+        self.bc_update_opportunities = 0
+        self.bc_updates_applied = 0
 
     def set_bc_progress_multiplier(self, multiplier: float) -> None:
         if not math.isfinite(multiplier) or not 0.0 <= multiplier <= 1.0:
@@ -263,6 +285,10 @@ class FullBehaviorCloningSACAgent(SACAgent):
     ) -> tuple[torch.Tensor, ...]:
         if task_index == 0 or self.reference_state_count == 0:
             return gradients
+        self.bc_update_opportunities += 1
+        if self.bc_update_opportunities % self.bc_update_interval != 0:
+            return gradients
+        self.bc_updates_applied += 1
         if self._max_reference_source_task_index >= task_index:
             invalid_sources = torch.unique(
                 self._episodic_source_task_indices[

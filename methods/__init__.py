@@ -7,18 +7,27 @@ from methods.full_bc_pcgrad import METHOD as FULL_BC_PCGRAD
 from methods.general_task_specific_bc import METHOD as GENERAL_TASK_SPECIFIC_BC
 from methods.jsrl_continual import METHOD as JSRL_CONTINUAL
 from methods.fine_tuning import METHOD as FINE_TUNING
+from methods.l2 import METHOD as L2
+from methods.ewc import METHOD as EWC
 from methods.packnet import METHOD as PACKNET
+from methods.ssde import APPROX_METHOD as SSDE_APPROX, METHOD as SSDE
 from methods.semantic_hybrid_bc import METHOD as SEMANTIC_HYBRID_BC
 from methods.semantic_local_bc import METHOD as SEMANTIC_LOCAL_BC
 from methods.stage_aware_semantic_bc import METHOD as STAGE_AWARE_SEMANTIC_BC
 from methods.success_replay_best_adaptive_pcgrad import (
     METHOD as SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
 )
+from methods.success_replay_best_adaptive_pcgrad_deep_critic_heads import (
+    METHOD as SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD_DEEP_CRITIC_HEADS,
+)
 from methods.semantic_routed_dual_critic_pcgrad import (
     METHOD as SEMANTIC_ROUTED_DUAL_CRITIC_PCGRAD,
 )
 from methods.semantic_routed_frozen_transfer_pcgrad import (
     METHOD as SEMANTIC_ROUTED_FROZEN_TRANSFER_PCGRAD,
+)
+from methods.semantic_routed_frozen_transfer_mixed80_pcgrad import (
+    METHOD as SEMANTIC_ROUTED_FROZEN_TRANSFER_MIXED80_PCGRAD,
 )
 from methods.success_replay_best_random_broader_adaptive_pcgrad import (
     METHOD as SUCCESS_REPLAY_BEST_RANDOM_BROADER_ADAPTIVE_PCGRAD,
@@ -55,8 +64,12 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
     for method in (
         SINGLE_TASK_BASELINE,
         FINE_TUNING,
+        L2,
+        EWC,
         TASK_CONDITIONED,
         PACKNET,
+        SSDE_APPROX,
+        SSDE,
         CLONEX_SAC,
         FULL_BC,
         FULL_BC_NORM_BALANCED,
@@ -68,8 +81,10 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
         SUCCESS_REPLAY_BEST,
         SUCCESS_REPLAY_BEST_PCGRAD,
         SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
+        SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD_DEEP_CRITIC_HEADS,
         SEMANTIC_ROUTED_DUAL_CRITIC_PCGRAD,
         SEMANTIC_ROUTED_FROZEN_TRANSFER_PCGRAD,
+        SEMANTIC_ROUTED_FROZEN_TRANSFER_MIXED80_PCGRAD,
         SUCCESS_REPLAY_BEST_RANDOM_BROADER_ADAPTIVE_PCGRAD,
         SUCCESS_REPLAY_BEST_LLM_BROADER_ADAPTIVE_PCGRAD,
         SUCCESS_REPLAY_BEST_CAGRAD,
@@ -93,8 +108,10 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
     "success_replay_best": "standard",
     "success_replay_best_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_adaptive_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_adaptive_pcgrad_deep_critic_heads": "pcgrad_sac_priority",
     "semantic_routed_dual_critic_pcgrad": "pcgrad_sac_priority",
     "semantic_routed_frozen_transfer_pcgrad": "pcgrad_sac_priority",
+    "semantic_routed_frozen_transfer_mixed80_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_random_broader_adaptive_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_llm_broader_adaptive_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_cagrad": "standard",
@@ -106,8 +123,10 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
 
 BC_COMBINATION_STRATEGY_BY_METHOD = {
     "success_replay_best_adaptive_pcgrad": "adaptive_additive",
+    "success_replay_best_adaptive_pcgrad_deep_critic_heads": "adaptive_additive",
     "semantic_routed_dual_critic_pcgrad": "adaptive_additive",
     "semantic_routed_frozen_transfer_pcgrad": "adaptive_additive",
+    "semantic_routed_frozen_transfer_mixed80_pcgrad": "adaptive_additive",
     "success_replay_best_random_broader_adaptive_pcgrad": "adaptive_additive",
     "success_replay_best_llm_broader_adaptive_pcgrad": "adaptive_additive",
     "success_replay_best_progress_pcgrad": "adaptive_additive",

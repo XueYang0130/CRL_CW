@@ -498,6 +498,16 @@ class SACTrainer:
                     terminated
                 ),
             )
+            transition_hook = getattr(
+                self.agent,
+                "on_environment_transition",
+                None,
+            )
+            if transition_hook is not None:
+                transition_hook(
+                    observation=observation,
+                    next_observation=next_observation,
+                )
 
             observation = next_observation
 

@@ -128,7 +128,22 @@ class SuccessfulStateReservoir:
             if replacement < self.capacity:
                 self._states[replacement] = state.copy()
 
-    def observations(self) -> np.ndarray:
+    def observations(
+        self,
+        *,
+        capacity: int | None = None,
+        seed: int | None = None,
+    ) -> np.ndarray:
+        if capacity is not None and capacity < 0:
+            raise ValueError("capacity must be non-negative.")
         if not self._states:
             return np.empty((0, self.observation_dim), dtype=np.float32)
-        return np.stack(self._states).astype(np.float32, copy=False)
+        states = self._states
+        if capacity is not None:
+            if capacity == 0:
+                return np.empty((0, self.observation_dim), dtype=np.float32)
+            if len(states) > capacity:
+                if seed is None:
+                    raise ValueError("seed is required when subsampling observations.")
+                states = random.Random(seed).sample(states, capacity)
+        return np.stack(states).astype(np.float32, copy=False)

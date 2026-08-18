@@ -150,6 +150,8 @@ Do not remove this special case when reproducing current results.
 | `fine_tuning` | Single-head SAC, no retention | Lower continual baseline. |
 | `task_conditioned` | Single head with task vector input | Conditioning ablation. |
 | `packnet` | PackNet SAC agent | Auxiliary baseline. |
+| `ssde` | Sparse descriptor-gated actor with SSDE task-transition mechanisms | Adapted SSDE reproduction. |
+| `ssde_approx` | Importance ownership plus activation reset | Lightweight diagnostic, not formal SSDE. |
 | `clonex_sac` | Multi-head, best-return exploration, KL cloning | Literature baseline. |
 | `full_bc` | Complete successful-trajectory KL cloning | Current empirical oracle. |
 | `semantic_local_bc` | Selected general semantic segments | Static semantic baseline. |

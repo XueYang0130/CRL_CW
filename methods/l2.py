@@ -1,6 +1,6 @@
 from typing import Any
 
-from agents import PackNetSACAgent, SACAgent
+from agents import L2SACAgent, SACAgent
 from methods.base import MethodSpec
 
 
@@ -9,22 +9,22 @@ def build_agent(
     args: Any,
     total_tasks: int,
 ) -> SACAgent:
-    return PackNetSACAgent(
+    del total_tasks
+    return L2SACAgent(
         **agent_kwargs,
-        total_tasks=total_tasks,
-        retrain_steps=args.packnet_retrain_steps,
+        cl_reg_coef=args.cl_reg_coef,
     )
 
 
 METHOD = MethodSpec(
-    method_id="packnet",
+    method_id="l2",
     modes=frozenset({"continual"}),
     append_task_id=True,
     multi_head=True,
     hide_task_id=True,
     reference_exploration=True,
     defaults={
-        "packnet_retrain_steps": 0,
+        "cl_reg_coef": 1_000.0,
         "gradient_clip_norm": 0.1,
     },
     agent_factory=build_agent,
