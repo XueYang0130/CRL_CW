@@ -26,6 +26,25 @@ CW10_TASKS: tuple[str, ...] = CW10_TASKS_V3
 CW10_NUM_TASKS = len(CW10_TASKS_V3)
 DEFAULT_EPISODE_LENGTH = 200
 
+# These are the eight active CW3 sequences in the official RECALL code.  CW6
+# repeats the corresponding CW3 sequence, preserving a distinct head per
+# sequence position even when an environment occurs more than once.
+CW3_TASK_SEQUENCES: dict[str, tuple[str, ...]] = {
+    "cw3_0": ("push", "window-close", "hammer"),
+    "cw3_1": ("hammer", "window-close", "faucet-close"),
+    "cw3_2": ("stick-pull", "push-back", "push-wall"),
+    "cw3_3": ("push-wall", "shelf-place", "push-back"),
+    "cw3_4": ("faucet-close", "shelf-place", "push-back"),
+    "cw3_5": ("stick-pull", "peg-unplug-side", "stick-pull"),
+    "cw3_6": ("window-close", "handle-press-side", "peg-unplug-side"),
+    "cw3_7": ("faucet-close", "shelf-place", "peg-unplug-side"),
+}
+CONTINUAL_TASK_SEQUENCE_NAMES: tuple[str, ...] = (
+    "cw10",
+    *CW3_TASK_SEQUENCES,
+    *(name.replace("cw3_", "cw6_") for name in CW3_TASK_SEQUENCES),
+)
+
 
 class StickPullV1CompatibleReward(gym.Wrapper):
     """Project-local reward override for stick-pull-v3.
@@ -218,6 +237,32 @@ def get_cw10_tasks(env_version: str = "v3") -> list[str]:
     return list(cw10_tasks_for_version(env_version))
 
 
+def get_continual_task_sequence(
+    sequence_name: str,
+    env_version: str = "v3",
+) -> list[str]:
+    """Resolve an official CW sequence using the requested environment version."""
+
+    normalized_name = sequence_name.strip().lower()
+    if normalized_name == "cw10":
+        return get_cw10_tasks(env_version)
+    if normalized_name.startswith("cw6_"):
+        cw3_name = normalized_name.replace("cw6_", "cw3_", 1)
+        try:
+            canonical_tasks = CW3_TASK_SEQUENCES[cw3_name]
+        except KeyError as exc:
+            raise ValueError(f"Unknown continual task sequence {sequence_name!r}.") from exc
+        canonical_tasks = canonical_tasks + canonical_tasks
+    else:
+        try:
+            canonical_tasks = CW3_TASK_SEQUENCES[normalized_name]
+        except KeyError as exc:
+            raise ValueError(f"Unknown continual task sequence {sequence_name!r}.") from exc
+    if env_version not in {"v2", "v3"}:
+        raise ValueError(f"Unsupported env_version {env_version!r}. Expected 'v2' or 'v3'.")
+    return [f"{task_name}-{env_version}" for task_name in canonical_tasks]
+
+
 def resolve_reward_function_version(
     task_name: str,
     reward_function_version: str,
@@ -240,6 +285,7 @@ def make_cw_env(
     reward_function_version: str = "v2",
     terminate_on_success: bool = False,
     num_task_ids: int = CW10_NUM_TASKS,
+    task_id_index: int | None = None,
 ) -> gym.Env:
     resolved_version = resolve_env_version(task_name, env_version)
     resolved_reward_version = resolve_reward_function_version(
@@ -280,7 +326,11 @@ def make_cw_env(
     if append_task_id:
         env = TaskOneHotObservation(
             env,
-            task_index=task_index_for_name(task_name),
+            task_index=(
+                task_index_for_name(task_name)
+                if task_id_index is None
+                else task_id_index
+            ),
             num_tasks=num_task_ids,
         )
 

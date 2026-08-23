@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from scripts.build_stickpull_matched_memory import (
     sample_stratified_broad_memory,
@@ -12,7 +13,11 @@ from scripts.run_stickpull_causal_ablation import (
     build_dynamic_success_dominant_memory,
     build_nonoverlapping_mixed_memory,
     configure_integration,
+    load_memory,
 )
+from agents import LayerwiseAdaptivePCGradAgent
+from methods import get_method, method_defaults
+from scripts.build_stickpull_matched_memory import build_agent_from_config
 
 
 def test_matched_memory_sampling_is_bounded_and_without_duplicates() -> None:
@@ -85,6 +90,16 @@ def test_causal_ablation_integration_modes_are_explicit() -> None:
 
     configure_integration(
         agent,
+        integration="layerwise_adaptive_pcgrad",
+        bc_update_interval=1,
+        adaptive_target_ratio=0.2,
+        adaptive_conflict_ratio=0.05,
+    )
+    assert agent.bc_gradient_strategy == "pcgrad_sac_priority"
+    assert agent.bc_combination_strategy == "adaptive_additive"
+
+    configure_integration(
+        agent,
         integration="plain",
         bc_update_interval=1,
         adaptive_target_ratio=0.05,
@@ -92,6 +107,87 @@ def test_causal_ablation_integration_modes_are_explicit() -> None:
     )
     assert agent.bc_gradient_strategy == "standard"
     assert agent.bc_combination_strategy == "average"
+
+
+def test_layerwise_method_builds_dedicated_agent() -> None:
+    method = get_method("success_replay_best_layerwise_adaptive_pcgrad")
+    config = method_defaults(method.method_id)
+    config.update(
+        {
+            "method": method.method_id,
+            "tasks": ["hammer-v3", "push-wall-v3"],
+            "seed": 0,
+            "env_version": "v3",
+            "reward_function_version": "cw10_v1",
+            "max_episode_steps": 200,
+            "learning_rate": 1e-3,
+            "gamma": 0.99,
+            "polyak": 0.995,
+            "target_output_std": 0.089,
+            "initial_log_alpha": 0.0,
+            "gradient_diagnostics_interval": 500,
+            "gradient_diagnostics_source_batch_size": 128,
+        }
+    )
+    agent = build_agent_from_config(config=config, device="cpu")
+    assert isinstance(agent, LayerwiseAdaptivePCGradAgent)
+    assert agent.bc_adaptive_target_ratio == 0.2
+    assert agent.bc_adaptive_conflict_ratio == 0.05
+
+
+def test_default_bc_cadence_supports_agent_without_legacy_api() -> None:
+    agent = SimpleNamespace(
+        bc_gradient_strategy="unexpected",
+        bc_combination_strategy="unexpected",
+    )
+
+    configure_integration(
+        agent,
+        integration="adaptive_pcgrad",
+        bc_update_interval=1,
+        adaptive_target_ratio=0.2,
+        adaptive_conflict_ratio=0.05,
+    )
+
+    assert agent.bc_gradient_strategy == "pcgrad_sac_priority"
+    assert agent.bc_combination_strategy == "adaptive_additive"
+
+
+def test_sparse_bc_rejects_agent_without_cadence_api() -> None:
+    agent = SimpleNamespace(
+        bc_gradient_strategy="unexpected",
+        bc_combination_strategy="unexpected",
+    )
+
+    with pytest.raises(RuntimeError, match="does not support sparse BC updates"):
+        configure_integration(
+            agent,
+            integration="adaptive_pcgrad",
+            bc_update_interval=4,
+            adaptive_target_ratio=0.2,
+            adaptive_conflict_ratio=0.05,
+        )
+
+
+def test_no_memory_condition_does_not_require_a_manifest() -> None:
+    agent = SimpleNamespace(reference_memory_cleared=False)
+    agent.clear_reference_memory = lambda: setattr(
+        agent, "reference_memory_cleared", True
+    )
+
+    states, manifest, rows = load_memory(
+        agent=agent,
+        manifest_path=None,
+        memory_mode="none",
+        expected_source_tasks=["task-a", "task-b"],
+        seed=3,
+    )
+
+    assert states == 0
+    assert rows == []
+    assert agent.reference_memory_cleared
+    assert manifest["purpose"] == "no_memory_control"
+    assert manifest["source_tasks"] == ["task-a", "task-b"]
 
 
 def test_mixed50_memory_is_task_balanced_and_nonoverlapping() -> None:

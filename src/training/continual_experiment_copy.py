@@ -15,7 +15,7 @@ from agents.gradient_diagnostics import (
     GRADIENT_TASK_PAIR_FIELDS,
     GRADIENT_WINDOW_FIELDS,
 )
-from envs import get_cw10_tasks, make_cw_env
+from envs import canonical_cw10_task_name, get_continual_task_sequence, make_cw_env
 from evaluation import EvaluationConfig, SACEvaluator, summarize_continual_run
 from methods import (
     bc_gradient_strategy_for_method,
@@ -69,7 +69,11 @@ from training.implicit_policy_prior import (
     collect_reset_observations,
     initialize_actor_head_from_source,
 )
-from training.success_replay import BroaderStateReservoir, SuccessfulStateReservoir
+from training.success_replay import (
+    BroaderStateReservoir,
+    SuccessfulStateReservoir,
+    select_success_dominant_memory,
+)
 from training.bc_progress_gate import BCProgressGate
 from utils import append_csv_rows, save_sac_checkpoint, write_csv, write_json
 
@@ -98,6 +102,11 @@ CW10_EVAL_FIELDS = [
     "q2_mean",
     "q_target_mean",
     "log_prob_mean",
+    "ensemble_critic_loss",
+    "q_ensemble_std_mean",
+    "td_error_abs_mean",
+    "priority_beta",
+    "importance_weight_mean",
     "bc_progress_score",
     "bc_progress_multiplier",
     "bc_progress_next_multiplier",
@@ -127,6 +136,7 @@ CW10_TASK_SUMMARY_FIELDS = [
     "success_replay_seen_states",
     "broader_replay_selector",
     "broader_replay_ratio",
+    "dynamic_broader_replay_fill",
     "broader_replay_target_states",
     "broader_replay_states",
     "broader_replay_quota_filled",
@@ -158,6 +168,17 @@ CW10_TASK_SUMMARY_FIELDS = [
     "policy_prior_final_kl",
     "bc_task_schedule_reason_codes",
     "bc_task_schedule_reason",
+    "critic_ensemble_size",
+    "optimistic_ucb_beta",
+    "optimistic_action_candidates",
+    "ucb_action_calls",
+    "mean_selected_q_uncertainty",
+    "n_step",
+    "prioritized_fraction",
+    "priority_alpha",
+    "priority_beta",
+    "mean_priority",
+    "max_priority",
 ]
 
 
@@ -403,7 +424,11 @@ def normalize_exploration_strategy(strategy: str) -> str:
     return aliases.get(strategy, strategy)
 
 
-def load_baseline_curves(path: str | None) -> list[list[float]] | None:
+def load_baseline_curves(
+    path: str | None,
+    *,
+    tasks: list[str] | None = None,
+) -> list[list[float]] | None:
     if path is None:
         return None
     with Path(path).open("r", encoding="utf-8") as file:
@@ -418,7 +443,27 @@ def load_baseline_curves(path: str | None) -> list[list[float]] | None:
             "Baseline curve file must contain a list-valued "
             "stochastic_success_curves field."
         )
-    return curves
+    baseline_tasks = payload.get("tasks")
+    if tasks is None or baseline_tasks is None:
+        return curves
+    if not isinstance(baseline_tasks, list) or len(baseline_tasks) != len(curves):
+        raise ValueError(
+            "Baseline curve tasks must be a list aligned with stochastic_success_curves."
+        )
+    curves_by_task: dict[str, list[float]] = {}
+    for task_name, curve in zip(baseline_tasks, curves, strict=True):
+        if not isinstance(task_name, str):
+            raise ValueError("Baseline curve task names must be strings.")
+        canonical_name = canonical_cw10_task_name(task_name)
+        if canonical_name in curves_by_task:
+            raise ValueError(f"Duplicate baseline curve task {task_name!r}.")
+        curves_by_task[canonical_name] = curve
+    try:
+        return [curves_by_task[canonical_cw10_task_name(task)] for task in tasks]
+    except KeyError as exc:
+        raise ValueError(
+            f"Baseline curves do not contain continual task {exc.args[0]!r}."
+        ) from exc
 
 
 def validate_baseline_curves_for_run(
@@ -456,6 +501,16 @@ def validate_baseline_curves_for_run(
             )
 
 
+def unique_task_metric_labels(tasks: list[str]) -> list[str]:
+    """Keep legacy names unless a repeated environment needs position identity."""
+
+    counts = {task: tasks.count(task) for task in set(tasks)}
+    return [
+        task if counts[task] == 1 else f"{task}@position_{index}"
+        for index, task in enumerate(tasks)
+    ]
+
+
 def select_best_return_guide(
     *,
     agent: SACAgent,
@@ -471,15 +526,26 @@ def select_best_return_guide(
     for head_index in range(task_index):
         returns = []
         for episode_index in range(episodes_per_head):
-            reset_result = env.reset(seed=seed + head_index * episodes_per_head + episode_index)
+            if getattr(agent, "official_recall_cumulative_guide_mask", False):
+                reset_result = env.reset()
+            else:
+                reset_result = env.reset(
+                    seed=seed + head_index * episodes_per_head + episode_index
+                )
             observation = reset_result[0] if isinstance(reset_result, tuple) else reset_result
             episode_return = 0.0
             for _ in range(max_episode_steps):
-                action = agent.select_guide_action(
-                    observation,
-                    guide_task_index=head_index,
-                    deterministic=False,
-                )
+                if getattr(agent, "official_recall_cumulative_guide_mask", False):
+                    action = agent.select_official_recall_guide_action(
+                        observation,
+                        head_index=head_index,
+                    )
+                else:
+                    action = agent.select_guide_action(
+                        observation,
+                        guide_task_index=head_index,
+                        deterministic=False,
+                    )
                 step_result = env.step(action)
                 if len(step_result) == 5:
                     observation, reward, terminated, truncated, _ = step_result
@@ -614,6 +680,7 @@ def evaluate_all_tasks(
             env_version=env_version,
             reward_function_version=reward_function_version,
             num_task_ids=num_task_ids,
+            task_id_index=eval_task_index,
         )
         deterministic = None
         if det_eval_episodes > 0:
@@ -662,6 +729,11 @@ def evaluate_all_tasks(
                 "q2_mean": "" if update_metrics is None else update_metrics.get("q2_mean", ""),
                 "q_target_mean": "" if update_metrics is None else update_metrics.get("q_target_mean", ""),
                 "log_prob_mean": "" if update_metrics is None else update_metrics.get("log_prob_mean", ""),
+                "ensemble_critic_loss": "" if update_metrics is None else update_metrics.get("ensemble_critic_loss", ""),
+                "q_ensemble_std_mean": "" if update_metrics is None else update_metrics.get("q_ensemble_std_mean", ""),
+                "td_error_abs_mean": "" if update_metrics is None else update_metrics.get("td_error_abs_mean", ""),
+                "priority_beta": "" if update_metrics is None else update_metrics.get("priority_beta", ""),
+                "importance_weight_mean": "" if update_metrics is None else update_metrics.get("importance_weight_mean", ""),
                 "elapsed_seconds": time.time() - started_at,
             }
         )
@@ -682,6 +754,7 @@ def collect_successful_reference_observations(
     max_attempts: int,
     seed: int,
     num_task_ids: int,
+    task_id_index: int,
 ) -> tuple[np.ndarray, int]:
     if episodes <= 0:
         raise ValueError("full_bc_reference_episodes must be positive.")
@@ -695,6 +768,7 @@ def collect_successful_reference_observations(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     kept_observations: list[np.ndarray] = []
     successful_episodes = 0
@@ -734,6 +808,7 @@ def collect_successful_reference_observations(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     try:
         observation_dim = int(empty_env.observation_space.shape[0])
@@ -760,6 +835,7 @@ def collect_segmented_reference_observations(
     segment_scheme: str = "heuristic_v1",
     post_success_steps: int = 10,
     num_task_ids: int = 10,
+    task_id_index: int | None = None,
 ) -> tuple[np.ndarray, int, int, int]:
     if not allowed_segments:
         raise ValueError("semantic_local_bc requires at least one semantic segment.")
@@ -798,6 +874,7 @@ def collect_segmented_reference_observations(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     selected_observations: list[np.ndarray] = []
     background_observations: list[np.ndarray] = []
@@ -916,6 +993,7 @@ def collect_segmented_reference_observations(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     try:
         observation_dim = int(empty_env.observation_space.shape[0])
@@ -943,6 +1021,7 @@ def collect_reference_payloads_by_segment(
     segment_scheme: str,
     post_success_steps: int,
     num_task_ids: int,
+    task_id_index: int,
 ) -> tuple[
     dict[str, dict[str, np.ndarray]],
     dict[str, dict[str, np.ndarray]],
@@ -956,6 +1035,7 @@ def collect_reference_payloads_by_segment(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     segment_observations: dict[str, list[np.ndarray]] = {
         segment: [] for segment in SEGMENT_ORDER
@@ -1071,7 +1151,9 @@ def collect_reference_payloads_by_segment(
 
 def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
     seed_global_rngs(args.seed)
-    tasks = get_cw10_tasks(args.env_version)[: args.sequence_task_count]
+    tasks = get_continual_task_sequence(args.task_sequence, args.env_version)
+    if args.task_sequence == "cw10":
+        tasks = tasks[: args.sequence_task_count]
     started_at = time.time()
     method = get_method(args.method)
     append_task_id = method.append_task_id
@@ -1084,6 +1166,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         env_version=args.env_version,
         reward_function_version=args.reward_function_version,
         num_task_ids=len(tasks),
+        task_id_index=0,
     )
     observation_dim = first_env.observation_space.shape[0]
     action_dim = first_env.action_space.shape[0]
@@ -1097,6 +1180,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         env_version=args.env_version,
         reward_function_version=args.reward_function_version,
         num_task_ids=len(tasks),
+        task_id_index=0,
     )
     agent = method.build_agent(
         args=args,
@@ -1146,12 +1230,22 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         raise RuntimeError(
             f"Method {args.method} does not support actor gradient diagnostics."
         )
-    replay_buffer = ReplayBuffer(
+    replay_buffer = method.build_replay_buffer(
+        args=args,
         observation_dim=observation_dim,
         action_dim=action_dim,
-        capacity=args.replay_size,
-        seed=args.seed,
     )
+    for attribute, expected in (
+        ("observation_dim", observation_dim),
+        ("action_dim", action_dim),
+        ("capacity", args.replay_size),
+    ):
+        actual = getattr(replay_buffer, attribute, None)
+        if actual != expected:
+            raise RuntimeError(
+                f"Method replay buffer {attribute} mismatch: "
+                f"expected={expected}, actual={actual}."
+            )
 
     config = vars(args).copy()
     config["tasks"] = tasks
@@ -1220,7 +1314,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             GRADIENT_TASK_PAIR_FIELDS,
             diagnostic_rows["task_pairs"],
         )
-    baseline_curves = load_baseline_curves(args.baseline_curves)
+    baseline_curves = load_baseline_curves(args.baseline_curves, tasks=tasks)
     validate_baseline_curves_for_run(
         baseline_curves,
         task_count=len(tasks),
@@ -1375,9 +1469,19 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             round(args.episodic_memory_per_task * (1.0 - method.broader_replay_ratio))
         )
         broader_replay_capacity = args.episodic_memory_per_task - success_replay_capacity
+        success_collection_capacity = (
+            args.episodic_memory_per_task
+            if method.dynamic_broader_replay_fill
+            else success_replay_capacity
+        )
+        broader_collection_capacity = (
+            args.episodic_memory_per_task
+            if method.dynamic_broader_replay_fill
+            else broader_replay_capacity
+        )
         success_replay = (
             SuccessfulStateReservoir(
-                capacity=success_replay_capacity,
+                capacity=success_collection_capacity,
                 observation_dim=observation_dim,
                 seed=args.seed + 600_000 + task_index,
             )
@@ -1386,7 +1490,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         )
         broader_replay = (
             BroaderStateReservoir(
-                capacity_per_bin=broader_replay_capacity,
+                capacity_per_bin=broader_collection_capacity,
                 observation_dim=observation_dim,
                 seed=args.seed + 650_000 + task_index,
             )
@@ -1547,6 +1651,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             env_version=args.env_version,
             reward_function_version=args.reward_function_version,
             num_task_ids=len(tasks),
+            task_id_index=task_index,
         )
         if method.llm_prior_initialization:
             if task_index == 0:
@@ -1661,6 +1766,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         curriculum_stage_best = float("-inf")
         curriculum_stage_evaluations = 0
         curriculum_transitions: list[dict[str, float | int | str]] = []
+        initial_autonomous_return: float | None = None
         guide_head_index = None
         guide_steps = 0
         if selected_guide is not None and method.guide_mode == "fixed_warmup":
@@ -1670,7 +1776,10 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             trainer_start_steps = args.wsrl_warmup_steps - 1
             trainer_update_after = max(args.update_after, args.wsrl_warmup_steps)
             exploration_head_index = selected_guide
-        elif selected_guide is not None and method.guide_mode == "curriculum":
+        elif selected_guide is not None and method.guide_mode in {
+            "curriculum",
+            "demonstration_curriculum",
+        }:
             if args.jsrl_moving_average_window <= 0:
                 raise ValueError("jsrl_moving_average_window must be positive.")
             if args.jsrl_min_evaluations_per_stage <= 0:
@@ -1705,6 +1814,42 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 raise ValueError("Initial JSRL guide steps must leave learner-controlled steps.")
             guide_head_index = selected_guide
             guide_steps = curriculum_horizons[0]
+            if method.guide_mode == "demonstration_curriculum":
+                initial_autonomous_return = evaluate_mixed_policy_return(
+                    agent=agent,
+                    env=env,
+                    guide_head_index=selected_guide,
+                    guide_steps=0,
+                    episodes=args.best_return_eval_episodes,
+                    max_episode_steps=args.max_episode_steps,
+                    seed=args.seed + 15_000 + task_index * 1_000,
+                )
+                improvement_potential = (
+                    selected_guide_return - initial_autonomous_return
+                )
+                guide_accepted = (
+                    improvement_potential > args.dg_min_guide_improvement
+                )
+                if not guide_accepted:
+                    curriculum_horizons = [0]
+                    guide_steps = 0
+                append_controller_log(
+                    run_dir / "jumpstart_controller_decisions.json",
+                    {
+                        "event": "old_guide_selected",
+                        "task_index": task_index,
+                        "task_name": task_name,
+                        "source_task_index": selected_guide,
+                        "source_task_name": tasks[selected_guide],
+                        "mean_return": selected_guide_return,
+                        "initial_autonomous_return": initial_autonomous_return,
+                        "improvement_potential": improvement_potential,
+                        "minimum_improvement": args.dg_min_guide_improvement,
+                        "guide_accepted": guide_accepted,
+                        "initial_guide_steps": guide_steps,
+                        "candidate_source_task_indices": list(range(task_index)),
+                    },
+                )
         trainer = SACTrainer(
             env=env,
             agent=agent,
@@ -1724,6 +1869,10 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 reseed_global_rng=(task_index == 0),
                 guide_head_index=guide_head_index,
                 guide_steps=guide_steps,
+                policy_from_start=bool(
+                    selected_guide is not None
+                    and method.policy_from_start_after_guide
+                ),
             ),
         )
         curriculum_eval_env = (
@@ -1735,8 +1884,9 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 env_version=args.env_version,
                 reward_function_version=args.reward_function_version,
                 num_task_ids=len(tasks),
+                task_id_index=task_index,
             )
-            if guide_head_index is not None
+            if guide_head_index is not None and guide_steps > 0
             else None
         )
 
@@ -1849,8 +1999,69 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     best_teacher_score = candidate_score
                     best_teacher_state = clone_module_state(agent.actor)
                     best_teacher_step = task_step
+            if (
+                method.guide_mode == "demonstration_curriculum"
+                and curriculum_horizons != [0]
+                and selected_guide_return is not None
+                and float(active_row["stochastic_average_return"])
+                > selected_guide_return
+            ):
+                promote_guide = getattr(
+                    agent,
+                    "promote_current_policy_to_guide",
+                    None,
+                )
+                if not callable(promote_guide):
+                    raise RuntimeError(
+                        "Demonstration curriculum agent does not expose guide promotion."
+                    )
+                previous_guide_source = str(
+                    getattr(agent, "active_guide_source", "unknown")
+                )
+                promoted = promote_guide(
+                    task_index=task_index,
+                    success_rate=float(active_row["stochastic_success_rate"]),
+                    mean_return=float(active_row["stochastic_average_return"]),
+                )
+                if promoted:
+                    renewed_from_h: int | None = None
+                    renewed_to_h: int | None = None
+                    if previous_guide_source == "old_task_snapshot":
+                        renewed_from_h = trainer.guide_steps
+                        curriculum_stage = 0
+                        trainer.set_guide_steps(curriculum_horizons[0])
+                        renewed_to_h = trainer.guide_steps
+                        curriculum_returns.clear()
+                        curriculum_reference = float(
+                            active_row["stochastic_average_return"]
+                        )
+                        curriculum_stage_best = float("-inf")
+                        curriculum_stage_evaluations = 0
+                    append_controller_log(
+                        run_dir / "jumpstart_controller_decisions.json",
+                        {
+                            "event": "current_policy_promoted",
+                            "task_index": task_index,
+                            "task_name": task_name,
+                            "task_step": task_step,
+                            "success_rate": float(
+                                active_row["stochastic_success_rate"]
+                            ),
+                            "mean_return": float(
+                                active_row["stochastic_average_return"]
+                            ),
+                            "passing_reference_return": selected_guide_return,
+                            "replacement_rule": "strictly_higher_autonomous_return",
+                            "guide_steps": trainer.guide_steps,
+                            "previous_guide_source": previous_guide_source,
+                            "horizon_renewed": renewed_from_h is not None,
+                            "renewed_from_h": renewed_from_h,
+                            "renewed_to_h": renewed_to_h,
+                        },
+                    )
             print(
-                f"[cw10] task={task_name} step={task_step:,}/{args.steps_per_task:,} "
+                f"[{args.task_sequence}] task={task_name} "
+                f"step={task_step:,}/{args.steps_per_task:,} "
                 f"success={active_row['stochastic_success_rate']:.3f} "
                 f"return={active_row['stochastic_average_return']:.3f}"
             )
@@ -2035,11 +2246,9 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     controller_log,
                 )
             if (
-                guide_head_index is not None
+                curriculum_eval_env is not None
                 and task_step % args.jsrl_evaluation_interval == 0
             ):
-                if curriculum_eval_env is None:
-                    raise RuntimeError("Missing JSRL curriculum evaluation environment.")
                 mixed_return = evaluate_mixed_policy_return(
                     agent=agent,
                     env=curriculum_eval_env,
@@ -2091,8 +2300,21 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                                 "reason": advance_reason,
                                 "moving_average_return": moving_average,
                                 "reference_return": threshold_reference,
+                                "guide_source": str(
+                                    getattr(agent, "active_guide_source", "old_task_snapshot")
+                                ),
                             }
                         )
+                        if method.guide_mode == "demonstration_curriculum":
+                            append_controller_log(
+                                run_dir / "jumpstart_controller_decisions.json",
+                                {
+                                    "event": "horizon_advanced",
+                                    "task_index": task_index,
+                                    "task_name": task_name,
+                                    **curriculum_transitions[-1],
+                                },
+                            )
 
         def record_completed_episode(
             observations: tuple[np.ndarray, ...],
@@ -2119,6 +2341,31 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             replay_buffer=replay_buffer,
             batch_size=args.batch_size,
         )
+        if method.guide_mode == "demonstration_curriculum":
+            if best_teacher_state is None or best_teacher_step is None:
+                raise RuntimeError(
+                    "Demonstration curriculum requires a best actor snapshot."
+                )
+            set_task_guide = getattr(agent, "set_task_guide_actor_state", None)
+            if not callable(set_task_guide):
+                raise RuntimeError(
+                    "Demonstration curriculum agent cannot commit its best guide."
+                )
+            set_task_guide(
+                task_index=task_index,
+                actor_state=best_teacher_state,
+            )
+            append_controller_log(
+                run_dir / "jumpstart_controller_decisions.json",
+                {
+                    "event": "task_guide_committed",
+                    "task_index": task_index,
+                    "task_name": task_name,
+                    "best_teacher_step": best_teacher_step,
+                    "best_teacher_success": best_teacher_score[0],
+                    "best_teacher_return": best_teacher_score[1],
+                },
+            )
         reference_success_episodes = None
         reference_states = None
         successful_reference_states = None
@@ -2140,11 +2387,25 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             reference_observations = success_replay.observations()
             reference_success_episodes = success_replay.successful_episodes
             successful_reference_states = int(reference_observations.shape[0])
+            effective_broader_replay_capacity = broader_replay_capacity
+            if method.dynamic_broader_replay_fill:
+                nominal_success_states = min(
+                    success_replay_capacity,
+                    successful_reference_states,
+                )
+                effective_broader_replay_capacity = (
+                    args.episodic_memory_per_task - nominal_success_states
+                )
+                reference_observations = success_replay.observations(
+                    capacity=nominal_success_states,
+                    seed=args.seed + 659_000 + task_index,
+                )
+                successful_reference_states = int(reference_observations.shape[0])
             broader_observations = np.empty(
                 (0, observation_dim), dtype=np.float32
             )
             if broader_replay is not None:
-                broader_replay_target_states = broader_replay_capacity
+                broader_replay_target_states = effective_broader_replay_capacity
                 candidate_counts = broader_replay.counts()
                 broader_replay_candidate_counts = json.dumps(
                     candidate_counts, sort_keys=True
@@ -2186,13 +2447,13 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 total_candidate_count = sum(candidate_counts.values())
                 if (
                     method.broader_replay_selector == "llm"
-                    and selected_candidate_count < broader_replay_capacity
-                    and total_candidate_count >= broader_replay_capacity
+                    and selected_candidate_count < effective_broader_replay_capacity
+                    and total_candidate_count >= effective_broader_replay_capacity
                 ):
                     broader_decision = random_fallback_decision(
                         "LLM-selected bins did not contain enough candidates "
                         f"for the broader quota ({selected_candidate_count}/"
-                        f"{broader_replay_capacity}); using all temporal bins."
+                        f"{effective_broader_replay_capacity}); using all temporal bins."
                     )
                 if method.broader_replay_selector == "llm":
                     append_controller_log(
@@ -2218,16 +2479,31 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 )
                 broader_replay_selection_source = broader_decision.source
                 broader_replay_selection_reason = broader_decision.reason
-                broader_observations = broader_replay.observations(
-                    selected_bins=broader_decision.selected_bins,
-                    capacity=broader_replay_capacity,
-                    seed=args.seed + 660_000 + task_index,
-                )
+                if method.dynamic_broader_replay_fill:
+                    reference_observations, broader_observations = (
+                        select_success_dominant_memory(
+                            successful=success_replay,
+                            broader=broader_replay,
+                            total_capacity=args.episodic_memory_per_task,
+                            nominal_success_capacity=success_replay_capacity,
+                            selected_bins=broader_decision.selected_bins,
+                            seed=args.seed + 660_000 + task_index,
+                        )
+                    )
+                    successful_reference_states = int(
+                        reference_observations.shape[0]
+                    )
+                else:
+                    broader_observations = broader_replay.observations(
+                        selected_bins=broader_decision.selected_bins,
+                        capacity=effective_broader_replay_capacity,
+                        seed=args.seed + 660_000 + task_index,
+                    )
                 broader_replay_states = int(broader_observations.shape[0])
                 broader_replay_quota_filled = (
                     0.0
-                    if broader_replay_capacity <= 0
-                    else broader_replay_states / broader_replay_capacity
+                    if effective_broader_replay_capacity <= 0
+                    else broader_replay_states / effective_broader_replay_capacity
                 )
             reference_observations = np.concatenate(
                 (reference_observations, broader_observations), axis=0
@@ -2285,6 +2561,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     max_attempts=args.full_bc_reference_max_attempts,
                     seed=args.seed + 40_000 + task_index * 1_000,
                     num_task_ids=len(tasks),
+                    task_id_index=task_index,
                 )
                 background_reference_states = 0
                 task_specific_reference_states = 0
@@ -2304,6 +2581,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     segment_scheme=args.semantic_segment_scheme,
                     post_success_steps=args.semantic_post_success_steps,
                     num_task_ids=len(tasks),
+                    task_id_index=task_index,
                 )
                 for segment, payload in per_segment_payloads.items():
                     if payload["observations"].shape[0] > 0:
@@ -2351,6 +2629,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     segment_scheme=args.semantic_segment_scheme,
                     post_success_steps=args.semantic_post_success_steps,
                     num_task_ids=len(tasks),
+                    task_id_index=task_index,
                 )
                 for segment, payload in per_segment_payloads.items():
                     if payload["observations"].shape[0] > 0:
@@ -2421,6 +2700,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     segment_scheme=args.semantic_segment_scheme,
                     post_success_steps=args.semantic_post_success_steps,
                     num_task_ids=len(tasks),
+                    task_id_index=task_index,
                 )
                 for segment, payload in per_segment_payloads.items():
                     if payload["observations"].shape[0] > 0:
@@ -2460,6 +2740,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 "bc_cagrad_alpha": getattr(agent, "bc_cagrad_alpha", None),
             },
         )
+        task_method_diagnostics = agent.task_diagnostics()
         task_summary_rows.append(
             {
                 "task_index": task_index,
@@ -2496,6 +2777,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 ),
                 "broader_replay_selector": method.broader_replay_selector,
                 "broader_replay_ratio": method.broader_replay_ratio,
+                "dynamic_broader_replay_fill": method.dynamic_broader_replay_fill,
                 "broader_replay_target_states": broader_replay_target_states,
                 "broader_replay_states": broader_replay_states,
                 "broader_replay_quota_filled": broader_replay_quota_filled,
@@ -2583,6 +2865,17 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 "bc_task_schedule_reason": (
                     None if schedule_decision is None else schedule_decision.reason
                 ),
+                "critic_ensemble_size": task_method_diagnostics.get("critic_ensemble_size"),
+                "optimistic_ucb_beta": task_method_diagnostics.get("optimistic_ucb_beta"),
+                "optimistic_action_candidates": task_method_diagnostics.get("optimistic_action_candidates"),
+                "ucb_action_calls": task_method_diagnostics.get("ucb_action_calls"),
+                "mean_selected_q_uncertainty": task_method_diagnostics.get("mean_selected_q_uncertainty"),
+                "n_step": task_method_diagnostics.get("n_step"),
+                "prioritized_fraction": task_method_diagnostics.get("prioritized_fraction"),
+                "priority_alpha": task_method_diagnostics.get("priority_alpha"),
+                "priority_beta": task_method_diagnostics.get("priority_beta"),
+                "mean_priority": task_method_diagnostics.get("mean_priority"),
+                "max_priority": task_method_diagnostics.get("max_priority"),
             }
         )
         env.close()
@@ -2634,6 +2927,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         tail_size=args.tail_size,
     )
     average_return = sum(sum(row) / len(row) for row in final_return_rows) / len(final_return_rows)
+    task_metric_labels = unique_task_metric_labels(tasks)
     summary_payload = {
         "method": args.method,
         "tasks": tasks,
@@ -2644,23 +2938,23 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         "raw_forward_transfer": metrics["raw_forward_transfer"],
         "area_forward_transfer": metrics["area_forward_transfer"],
         "forward_transfer_available": metrics["forward_transfer_available"],
-        "final_per_task_success": dict(zip(tasks, metrics["final_per_task"], strict=True)),
-        "end_of_task_per_task": dict(zip(tasks, metrics["end_of_task_per_task"], strict=True)),
-        "forgetting_per_task": dict(zip(tasks, metrics["forgetting_per_task"], strict=True)),
+        "final_per_task_success": dict(zip(task_metric_labels, metrics["final_per_task"], strict=True)),
+        "end_of_task_per_task": dict(zip(task_metric_labels, metrics["end_of_task_per_task"], strict=True)),
+        "forgetting_per_task": dict(zip(task_metric_labels, metrics["forgetting_per_task"], strict=True)),
         "raw_forward_transfer_per_task": (
             None
             if metrics["raw_forward_transfer_per_task"][0] is None
-            else dict(zip(tasks, metrics["raw_forward_transfer_per_task"], strict=True))
+            else dict(zip(task_metric_labels, metrics["raw_forward_transfer_per_task"], strict=True))
         ),
         "normalized_forward_transfer_per_task": (
             None
             if metrics["normalized_forward_transfer_per_task"][0] is None
-            else dict(zip(tasks, metrics["normalized_forward_transfer_per_task"], strict=True))
+            else dict(zip(task_metric_labels, metrics["normalized_forward_transfer_per_task"], strict=True))
         ),
         "area_forward_transfer_per_task": (
             None
             if metrics["area_forward_transfer_per_task"][0] is None
-            else dict(zip(tasks, metrics["area_forward_transfer_per_task"], strict=True))
+            else dict(zip(task_metric_labels, metrics["area_forward_transfer_per_task"], strict=True))
         ),
         "run_directory": str(run_dir),
         "elapsed_seconds": time.time() - started_at,

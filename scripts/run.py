@@ -20,7 +20,7 @@ if str(SRC_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from envs import DEFAULT_EPISODE_LENGTH, get_cw10_tasks
+from envs import CONTINUAL_TASK_SEQUENCE_NAMES, DEFAULT_EPISODE_LENGTH, get_cw10_tasks
 from evaluation import aggregate_single_task_baselines
 from methods import (
     available_method_ids,
@@ -79,6 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps-per-task", type=int, default=1_000_000)
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--sequence-task-count", type=int, default=10)
+    parser.add_argument(
+        "--task-sequence",
+        choices=CONTINUAL_TASK_SEQUENCE_NAMES,
+        default="cw10",
+        help="Named continual sequence; cw3_0..cw3_7 and cw6_0..cw6_7 match RECALL.",
+    )
     parser.add_argument("--num-tasks", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=20_000)
     parser.add_argument("--det-eval-episodes", type=int, default=1)
@@ -86,6 +92,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--best-return-eval-episodes", type=int, default=2)
     parser.add_argument("--replay-size", type=int, default=1_000_000)
     parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--critic-ensemble-size", type=int, default=2)
+    parser.add_argument("--critic-bootstrap-probability", type=float, default=0.8)
+    parser.add_argument("--optimistic-ucb-beta", type=float, default=0.0)
+    parser.add_argument("--optimistic-action-candidates", type=int, default=1)
+    parser.add_argument("--n-step-return", type=int, default=1)
+    parser.add_argument("--prioritized-replay-fraction", type=float, default=0.0)
+    parser.add_argument("--priority-alpha", type=float, default=0.6)
+    parser.add_argument("--priority-beta-start", type=float, default=0.4)
+    parser.add_argument("--priority-beta-end", type=float, default=1.0)
+    parser.add_argument(
+        "--priority-beta-steps",
+        type=int,
+        default=0,
+        help="PER beta annealing steps; zero uses --steps-per-task.",
+    )
+    parser.add_argument("--priority-epsilon", type=float, default=1e-6)
     parser.add_argument("--start-steps", type=int, default=10_000)
     parser.add_argument("--update-after", type=int, default=1_000)
     parser.add_argument("--update-every", type=int, default=50)
@@ -149,6 +171,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodic-memory-per-task", type=int, default=0)
     parser.add_argument("--episodic-batch-size", type=int, default=0)
     parser.add_argument("--actor-cloning-coefficient", type=float, default=0.0)
+    parser.add_argument("--recall-value-reg-coef", type=float, default=1.0)
+    parser.add_argument(
+        "--recall-regularize-critic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--bc-gradient-strategy",
         choices=("standard", "norm_balanced", "pcgrad_sac_priority"),
@@ -163,6 +191,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bc-adaptive-target-ratio", type=float, default=0.2)
     parser.add_argument("--bc-adaptive-conflict-ratio", type=float, default=0.05)
     parser.add_argument("--bc-cagrad-alpha", type=float, default=0.5)
+    parser.add_argument("--kl-budget-low", type=float, default=0.05)
+    parser.add_argument("--kl-budget-high", type=float, default=0.5)
+    parser.add_argument("--kl-budget-ema-beta", type=float, default=0.99)
     parser.add_argument("--conflict-lora-rank", type=int, default=4)
     parser.add_argument("--conflict-lora-coefficient", type=float, default=1.0)
     parser.add_argument("--conflict-lora-max-norm-ratio", type=float, default=0.25)
@@ -261,6 +292,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--jsrl-stage-tolerance", type=float, default=0.10)
     parser.add_argument("--jsrl-min-evaluations-per-stage", type=int, default=1)
     parser.add_argument("--jsrl-max-evaluations-without-advance", type=int, default=5)
+    parser.add_argument("--dg-min-guide-improvement", type=float, default=0.0)
     parser.add_argument("--aggregate-tail-size", type=int, default=5)
     parser.add_argument("--tail-size", type=int, default=5)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -309,6 +341,17 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--sequence-task-count applies only to continual mode; use "
             "--num-tasks for single-batch mode."
+        )
+    if args.mode != "continual" and "task_sequence" in supplied_keys:
+        parser.error("--task-sequence applies only to continual mode.")
+    if (
+        args.mode == "continual"
+        and args.task_sequence != "cw10"
+        and "sequence_task_count" in supplied_keys
+    ):
+        parser.error(
+            "--sequence-task-count cannot be combined with a named CW3/CW6 "
+            "--task-sequence."
         )
     for key, value in method_defaults(args.method).items():
         if key not in explicit_destinations and key not in configured_keys:
@@ -402,6 +445,36 @@ def parse_args() -> argparse.Namespace:
         parser.error("Training steps must be positive.")
     if args.replay_size <= 0 or args.batch_size <= 0:
         parser.error("Replay size and batch size must be positive.")
+    if args.critic_ensemble_size < 2:
+        parser.error("--critic-ensemble-size must be at least two.")
+    if (
+        not math.isfinite(args.critic_bootstrap_probability)
+        or not 0.0 < args.critic_bootstrap_probability <= 1.0
+    ):
+        parser.error("--critic-bootstrap-probability must be in (0, 1].")
+    if not math.isfinite(args.optimistic_ucb_beta) or args.optimistic_ucb_beta < 0.0:
+        parser.error("--optimistic-ucb-beta must be finite and non-negative.")
+    if args.optimistic_action_candidates <= 0:
+        parser.error("--optimistic-action-candidates must be positive.")
+    if args.n_step_return <= 0:
+        parser.error("--n-step-return must be positive.")
+    if (
+        not math.isfinite(args.prioritized_replay_fraction)
+        or not 0.0 <= args.prioritized_replay_fraction <= 1.0
+    ):
+        parser.error("--prioritized-replay-fraction must be in [0, 1].")
+    if not math.isfinite(args.priority_alpha) or args.priority_alpha < 0.0:
+        parser.error("--priority-alpha must be finite and non-negative.")
+    if (
+        not math.isfinite(args.priority_beta_start)
+        or not math.isfinite(args.priority_beta_end)
+        or not 0.0 <= args.priority_beta_start <= args.priority_beta_end <= 1.0
+    ):
+        parser.error("PER betas must satisfy 0 <= start <= end <= 1.")
+    if args.priority_beta_steps < 0:
+        parser.error("--priority-beta-steps must be non-negative.")
+    if not math.isfinite(args.priority_epsilon) or args.priority_epsilon <= 0.0:
+        parser.error("--priority-epsilon must be finite and positive.")
     if (
         get_method(args.method).success_replay_teacher is not None
         and args.episodic_memory_per_task <= 0
@@ -440,6 +513,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--actor-cloning-coefficient must be finite and non-negative."
         )
+    if not math.isfinite(args.recall_value_reg_coef) or args.recall_value_reg_coef < 0.0:
+        parser.error("--recall-value-reg-coef must be finite and non-negative.")
     if not math.isfinite(args.bc_max_norm_ratio) or args.bc_max_norm_ratio <= 0.0:
         parser.error("--bc-max-norm-ratio must be finite and positive.")
     if (
@@ -459,6 +534,15 @@ def parse_args() -> argparse.Namespace:
         )
     if not math.isfinite(args.bc_cagrad_alpha) or not 0.0 <= args.bc_cagrad_alpha < 1.0:
         parser.error("--bc-cagrad-alpha must be finite and in [0, 1).")
+    if not math.isfinite(args.kl_budget_low) or args.kl_budget_low < 0.0:
+        parser.error("--kl-budget-low must be finite and non-negative.")
+    if not math.isfinite(args.kl_budget_high) or args.kl_budget_high <= args.kl_budget_low:
+        parser.error("--kl-budget-high must be finite and exceed --kl-budget-low.")
+    if (
+        not math.isfinite(args.kl_budget_ema_beta)
+        or not 0.0 <= args.kl_budget_ema_beta < 1.0
+    ):
+        parser.error("--kl-budget-ema-beta must be finite and in [0, 1).")
     if args.conflict_lora_rank <= 0:
         parser.error("--conflict-lora-rank must be positive.")
     if (
@@ -575,7 +659,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--packnet-retrain-steps must be non-negative.")
     if args.method == "wsrl_continual" and args.wsrl_warmup_steps <= 0:
         parser.error("--wsrl-warmup-steps must be positive.")
-    if args.method == "jsrl_continual":
+    if get_method(args.method).guide_mode in {"curriculum", "demonstration_curriculum"}:
         if not 0 < args.jsrl_initial_guide_steps < args.max_episode_steps:
             parser.error(
                 "--jsrl-initial-guide-steps must be positive and below the episode horizon."
@@ -607,6 +691,8 @@ def parse_args() -> argparse.Namespace:
                 "--jsrl-max-evaluations-without-advance must be at least both "
                 "the moving-average window and minimum evaluations per stage."
             )
+    if not math.isfinite(args.dg_min_guide_improvement):
+        parser.error("--dg-min-guide-improvement must be finite.")
     if args.stoch_eval_episodes <= 0:
         parser.error("--stoch-eval-episodes must be positive.")
     if args.det_eval_episodes < 0:

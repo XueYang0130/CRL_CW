@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         default=Path("outputs/analysis/rliable_cw10_seeds0_5"),
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=list(range(6)))
-    parser.add_argument("--bootstrap-reps", type=int, default=50_000)
+    parser.add_argument("--bootstrap-reps", type=int, default=10_000)
     parser.add_argument("--profile-reps", type=int, default=5_000)
     parser.add_argument("--random-seed", type=int, default=20260818)
     return parser.parse_args()

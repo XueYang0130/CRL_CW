@@ -10,12 +10,25 @@ from methods.fine_tuning import METHOD as FINE_TUNING
 from methods.l2 import METHOD as L2
 from methods.ewc import METHOD as EWC
 from methods.packnet import METHOD as PACKNET
+from methods.recall import METHOD as RECALL
 from methods.ssde import APPROX_METHOD as SSDE_APPROX, METHOD as SSDE
 from methods.semantic_hybrid_bc import METHOD as SEMANTIC_HYBRID_BC
 from methods.semantic_local_bc import METHOD as SEMANTIC_LOCAL_BC
 from methods.stage_aware_semantic_bc import METHOD as STAGE_AWARE_SEMANTIC_BC
 from methods.success_replay_best_adaptive_pcgrad import (
     METHOD as SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
+)
+from methods.success_replay_best_layerwise_adaptive_pcgrad import (
+    METHOD as SUCCESS_REPLAY_BEST_LAYERWISE_ADAPTIVE_PCGRAD,
+)
+from methods.success_replay_mixed80_optimistic_nstep_pcgrad import (
+    METHOD as SUCCESS_REPLAY_MIXED80_OPTIMISTIC_NSTEP_PCGRAD,
+)
+from methods.success_replay_best_kl_budget_pcgrad import (
+    METHOD as SUCCESS_REPLAY_BEST_KL_BUDGET_PCGRAD,
+)
+from methods.success_replay_best_jumpstart_adaptive_pcgrad import (
+    METHOD as SUCCESS_REPLAY_BEST_JUMPSTART_ADAPTIVE_PCGRAD,
 )
 from methods.success_replay_best_adaptive_pcgrad_deep_critic_heads import (
     METHOD as SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD_DEEP_CRITIC_HEADS,
@@ -70,6 +83,7 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
         PACKNET,
         SSDE_APPROX,
         SSDE,
+        RECALL,
         CLONEX_SAC,
         FULL_BC,
         FULL_BC_NORM_BALANCED,
@@ -81,6 +95,10 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
         SUCCESS_REPLAY_BEST,
         SUCCESS_REPLAY_BEST_PCGRAD,
         SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
+        SUCCESS_REPLAY_BEST_LAYERWISE_ADAPTIVE_PCGRAD,
+        SUCCESS_REPLAY_MIXED80_OPTIMISTIC_NSTEP_PCGRAD,
+        SUCCESS_REPLAY_BEST_KL_BUDGET_PCGRAD,
+        SUCCESS_REPLAY_BEST_JUMPSTART_ADAPTIVE_PCGRAD,
         SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD_DEEP_CRITIC_HEADS,
         SEMANTIC_ROUTED_DUAL_CRITIC_PCGRAD,
         SEMANTIC_ROUTED_FROZEN_TRANSFER_PCGRAD,
@@ -101,6 +119,7 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
 
 BC_GRADIENT_STRATEGY_BY_METHOD = {
     "clonex_sac": "standard",
+    "recall": "standard",
     "full_bc": "standard",
     "full_bc_norm_balanced": "norm_balanced",
     "full_bc_pcgrad": "pcgrad_sac_priority",
@@ -108,6 +127,10 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
     "success_replay_best": "standard",
     "success_replay_best_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_adaptive_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_layerwise_adaptive_pcgrad": "pcgrad_sac_priority",
+    "success_replay_mixed80_optimistic_nstep_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_kl_budget_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_jumpstart_adaptive_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_adaptive_pcgrad_deep_critic_heads": "pcgrad_sac_priority",
     "semantic_routed_dual_critic_pcgrad": "pcgrad_sac_priority",
     "semantic_routed_frozen_transfer_pcgrad": "pcgrad_sac_priority",
@@ -123,6 +146,10 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
 
 BC_COMBINATION_STRATEGY_BY_METHOD = {
     "success_replay_best_adaptive_pcgrad": "adaptive_additive",
+    "success_replay_best_layerwise_adaptive_pcgrad": "adaptive_additive",
+    "success_replay_mixed80_optimistic_nstep_pcgrad": "adaptive_additive",
+    "success_replay_best_kl_budget_pcgrad": "adaptive_additive",
+    "success_replay_best_jumpstart_adaptive_pcgrad": "adaptive_additive",
     "success_replay_best_adaptive_pcgrad_deep_critic_heads": "adaptive_additive",
     "semantic_routed_dual_critic_pcgrad": "adaptive_additive",
     "semantic_routed_frozen_transfer_pcgrad": "adaptive_additive",

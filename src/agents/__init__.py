@@ -8,12 +8,21 @@ from agents.networks import (
     QCritic,
 )
 from agents.replay_buffer import ReplayBatch, ReplayBuffer
+from agents.prioritized_nstep_replay import (
+    PrioritizedNStepReplayBuffer,
+    PrioritizedReplayBatch,
+)
 from agents.clonex_sac_agent import ClonExSACAgent
 from agents.conflict_lora_agent import ConflictLoRAFullBCAgent
 from agents.deep_head_critic_agent import DeepHeadCriticFullBCAgent
+from agents.demonstration_guided_full_bc_agent import DemonstrationGuidedFullBCAgent
 from agents.full_bc_agent import FullBehaviorCloningSACAgent
+from agents.layerwise_pcgrad_agent import LayerwiseAdaptivePCGradAgent
+from agents.optimistic_ensemble_bc_agent import OptimisticEnsembleFullBCAgent
+from agents.kl_budget_full_bc_agent import KLBudgetFullBehaviorCloningSACAgent
 from agents.local_bc_agent import LocalBehaviorCloningSACAgent
 from agents.packnet_agent import PackNetSACAgent
+from agents.recall_agent import RECALLAgent
 from agents.regularization_agents import EWCSACAgent, L2SACAgent
 from agents.sac_agent import SACAgent
 from agents.semantic_routed_dual_critic_agent import (
@@ -40,14 +49,21 @@ __all__ = [
     "QCritic",
     "ReplayBatch",
     "ReplayBuffer",
+    "PrioritizedNStepReplayBuffer",
+    "PrioritizedReplayBatch",
     "ClonExSACAgent",
     "ConflictLoRAFullBCAgent",
     "DeepHeadCriticFullBCAgent",
+    "DemonstrationGuidedFullBCAgent",
     "FullBehaviorCloningSACAgent",
+    "LayerwiseAdaptivePCGradAgent",
+    "OptimisticEnsembleFullBCAgent",
+    "KLBudgetFullBehaviorCloningSACAgent",
     "LocalBehaviorCloningSACAgent",
     "PackNetSACAgent",
     "L2SACAgent",
     "EWCSACAgent",
+    "RECALLAgent",
     "SSDESACAgent",
     "SSDEFullSACAgent",
     "SSDEGaussianActor",

@@ -20,7 +20,7 @@ if str(SRC_DIR) not in sys.path:
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from envs import DEFAULT_EPISODE_LENGTH, get_cw10_tasks
+from envs import CONTINUAL_TASK_SEQUENCE_NAMES, DEFAULT_EPISODE_LENGTH, get_cw10_tasks
 from evaluation import aggregate_single_task_baselines
 from methods import (
     available_method_ids,
@@ -79,6 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps-per-task", type=int, default=1_000_000)
     parser.add_argument("--total-steps", type=int, default=None)
     parser.add_argument("--sequence-task-count", type=int, default=10)
+    parser.add_argument(
+        "--task-sequence",
+        choices=CONTINUAL_TASK_SEQUENCE_NAMES,
+        default="cw10",
+        help="Named continual sequence; cw3_0..cw3_7 and cw6_0..cw6_7 match RECALL.",
+    )
     parser.add_argument("--num-tasks", type=int, default=10)
     parser.add_argument("--eval-every", type=int, default=20_000)
     parser.add_argument("--det-eval-episodes", type=int, default=1)
@@ -265,6 +271,17 @@ def parse_args() -> argparse.Namespace:
         parser.error(
             "--sequence-task-count applies only to continual mode; use "
             "--num-tasks for single-batch mode."
+        )
+    if args.mode != "continual" and "task_sequence" in supplied_keys:
+        parser.error("--task-sequence applies only to continual mode.")
+    if (
+        args.mode == "continual"
+        and args.task_sequence != "cw10"
+        and "sequence_task_count" in supplied_keys
+    ):
+        parser.error(
+            "--sequence-task-count cannot be combined with a named CW3/CW6 "
+            "--task-sequence."
         )
     for key, value in method_defaults(args.method).items():
         if key not in explicit_destinations and key not in configured_keys:

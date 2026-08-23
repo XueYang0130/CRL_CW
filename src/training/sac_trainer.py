@@ -204,6 +204,7 @@ class SACTrainerConfig:
     reseed_global_rng: bool = True
     guide_head_index: int | None = None
     guide_steps: int = 0
+    policy_from_start: bool = False
 
     def __post_init__(self) -> None:
         """Validate configuration values."""
@@ -521,6 +522,9 @@ class SACTrainer:
             # 3. Record and reset a completed episode.
             # =====================================================
             if episode_ended:
+                end_episode = getattr(self.replay_buffer, "end_episode", None)
+                if callable(end_episode):
+                    end_episode()
                 if completed_episode_callback is not None:
                     completed_episode_callback(
                         tuple(episode_observations),
@@ -569,7 +573,6 @@ class SACTrainer:
 
             if self._should_update(environment_step):
                 for update_index in range(self.config.update_every):
-                    batch = self._sample_training_batch()
                     collect_metrics = bool(
                         update_index
                         == self.config.update_every - 1
@@ -578,14 +581,32 @@ class SACTrainer:
                         )
                     )
 
-                    update_metrics = self.agent.update_batch(
-                        observations=batch["observations"],
-                        actions=batch["actions"],
-                        rewards=batch["rewards"],
-                        next_observations=batch["next_observations"],
-                        dones=batch["terminated"],
-                        collect_metrics=collect_metrics,
+                    update_from_replay = getattr(
+                        self.agent,
+                        "update_from_replay_buffer",
+                        None,
                     )
+                    if callable(update_from_replay):
+                        if self.reference_replay_buffer is not None:
+                            raise RuntimeError(
+                                "Method-specific replay updates cannot be combined "
+                                "with SACTrainer reference replay."
+                            )
+                        update_metrics = update_from_replay(
+                            replay_buffer=self.replay_buffer,
+                            batch_size=self.config.batch_size,
+                            collect_metrics=collect_metrics,
+                        )
+                    else:
+                        batch = self._sample_training_batch()
+                        update_metrics = self.agent.update_batch(
+                            observations=batch["observations"],
+                            actions=batch["actions"],
+                            rewards=batch["rewards"],
+                            next_observations=batch["next_observations"],
+                            dones=batch["terminated"],
+                            collect_metrics=collect_metrics,
+                        )
 
                     if update_metrics is not None:
                         last_update_metrics = update_metrics
@@ -601,6 +622,10 @@ class SACTrainer:
                     gradient_updates,
                     last_update_metrics,
                 )
+
+        flush_pending = getattr(self.replay_buffer, "flush_pending", None)
+        if callable(flush_pending):
+            flush_pending()
 
         return TrainingSummary(
             total_env_steps=(
@@ -628,7 +653,12 @@ class SACTrainer:
         episode_step: int,
     ) -> np.ndarray:
         """Select an exploration or current-policy action."""
-        if (
+        if self.config.policy_from_start:
+            action = self.agent.select_action(
+                observation,
+                deterministic=False,
+            )
+        elif (
             self.config.guide_head_index is not None
             and episode_step < self._guide_steps
         ):

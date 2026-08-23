@@ -8,6 +8,55 @@ import numpy as np
 BROADER_TEMPORAL_BINS: tuple[str, ...] = ("early", "middle", "late")
 
 
+def select_success_dominant_memory(
+    *,
+    successful: "SuccessfulStateReservoir",
+    broader: "BroaderStateReservoir",
+    total_capacity: int,
+    nominal_success_capacity: int,
+    selected_bins: tuple[str, ...] = BROADER_TEMPORAL_BINS,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select a fixed-budget success-preferred memory with broad fallback.
+
+    The nominal successful quota is used whenever enough successful states and
+    broad candidates exist.  Missing successful states are replaced by broad
+    states.  If the selected broad bins are themselves underfilled, additional
+    successful states fill the remaining budget.  The two reservoirs are
+    disjoint by construction because broader replay only records failed
+    episodes.
+    """
+    if total_capacity <= 0:
+        raise ValueError("total_capacity must be positive.")
+    if not 0 <= nominal_success_capacity <= total_capacity:
+        raise ValueError(
+            "nominal_success_capacity must be within the total capacity."
+        )
+
+    available_success = successful.observations()
+    initial_success_count = min(
+        nominal_success_capacity,
+        int(available_success.shape[0]),
+    )
+    initial_broad_target = total_capacity - initial_success_count
+    broad_observations = broader.observations(
+        selected_bins=selected_bins,
+        capacity=initial_broad_target,
+        seed=seed + 1,
+    )
+    final_success_target = min(
+        total_capacity - int(broad_observations.shape[0]),
+        int(available_success.shape[0]),
+    )
+    success_observations = successful.observations(
+        capacity=final_success_target,
+        seed=seed,
+    )
+    if success_observations.shape[0] + broad_observations.shape[0] > total_capacity:
+        raise RuntimeError("Dynamic replay selection exceeded its fixed budget.")
+    return success_observations, broad_observations
+
+
 class BroaderStateReservoir:
     """Fixed-capacity temporal reservoirs from non-successful episodes."""
 

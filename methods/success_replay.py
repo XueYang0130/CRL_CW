@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from agents import FullBehaviorCloningSACAgent, SACAgent
-from methods.base import MethodSpec
+from methods.base import MethodSpec, ReplayFactory
 
 
 def build_agent(
@@ -37,7 +37,10 @@ def make_success_replay_method(
     defaults: dict[str, object] | None = None,
     broader_replay_selector: str | None = None,
     broader_replay_ratio: float = 0.0,
+    dynamic_broader_replay_fill: bool = False,
+    guide_mode: str = "none",
     agent_factory: Callable[[dict[str, Any], Any, int], SACAgent] = build_agent,
+    replay_factory: ReplayFactory | None = None,
 ) -> MethodSpec:
     method_defaults = {
         "exploration_strategy": "best_return",
@@ -67,6 +70,9 @@ def make_success_replay_method(
         success_replay_teacher=teacher,
         broader_replay_selector=broader_replay_selector,
         broader_replay_ratio=broader_replay_ratio,
+        dynamic_broader_replay_fill=dynamic_broader_replay_fill,
+        guide_mode=guide_mode,
         defaults=method_defaults,
         agent_factory=agent_factory,
+        replay_factory=replay_factory,
     )

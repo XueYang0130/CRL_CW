@@ -4,10 +4,11 @@ from dataclasses import dataclass, field
 import math
 from typing import Any, Callable
 
-from agents import SACAgent
+from agents import ReplayBuffer, SACAgent
 
 
 AgentFactory = Callable[[dict[str, Any], Any, int], SACAgent]
+ReplayFactory = Callable[[int, int, Any], object]
 
 
 def build_sac_agent(
@@ -34,8 +35,11 @@ class MethodSpec:
     success_replay_teacher: str | None = None
     broader_replay_selector: str | None = None
     broader_replay_ratio: float = 0.0
+    dynamic_broader_replay_fill: bool = False
     guide_mode: str = "none"
     llm_prior_initialization: bool = False
+    policy_from_start_after_guide: bool = False
+    replay_factory: ReplayFactory | None = None
 
     def __post_init__(self) -> None:
         if self.success_replay_teacher not in {None, "final", "best"}:
@@ -52,6 +56,10 @@ class MethodSpec:
             raise ValueError("broader_replay_ratio requires a broader replay selector.")
         if self.broader_replay_selector is not None and self.success_replay_teacher is None:
             raise ValueError("Broader replay requires a success-replay teacher.")
+        if self.dynamic_broader_replay_fill and self.broader_replay_selector is None:
+            raise ValueError(
+                "dynamic_broader_replay_fill requires a broader replay selector."
+            )
 
     def build_agent(
         self,
@@ -95,3 +103,25 @@ class MethodSpec:
         if not self.reference_exploration or task_index == 0 or strategy == "random":
             return None, None
         return strategy, task_index + 1
+
+    def build_replay_buffer(
+        self,
+        *,
+        args: Any,
+        observation_dim: int,
+        action_dim: int,
+    ) -> object:
+        """Build the online replay used by this method.
+
+        Existing methods retain the exact standard ReplayBuffer constructor.
+        A method must explicitly provide ``replay_factory`` to opt into a
+        different sampling/update contract.
+        """
+        if self.replay_factory is None:
+            return ReplayBuffer(
+                observation_dim=observation_dim,
+                action_dim=action_dim,
+                capacity=args.replay_size,
+                seed=args.seed,
+            )
+        return self.replay_factory(observation_dim, action_dim, args)

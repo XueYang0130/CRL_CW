@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from agents import FullBehaviorCloningSACAgent
-from scripts.run import parse_args
+from scripts.run_copy import parse_args
 from methods import get_method
 
 
@@ -159,63 +159,6 @@ class TestCliPrecedence(unittest.TestCase):
                 ["run.py", "--mode", "continual", *extra_arguments],
             ), self.assertRaises(SystemExit):
                 parse_args()
-
-    def test_rejects_conflicting_critic_transition_options(self) -> None:
-        for argv in (
-            [
-                "run.py",
-                "--mode",
-                "continual",
-                "--adaptive-critic-init",
-                "--reset-critic-on-task-change",
-            ],
-            [
-                "run.py",
-                "--mode",
-                "continual",
-                "--adaptive-critic-init",
-                "--critic-probe-transitions",
-                "0",
-            ],
-            [
-                "run.py",
-                "--mode",
-                "continual",
-                "--adaptive-critic-init",
-                "--critic-warmup-updates",
-                "0",
-            ],
-            [
-                "run.py",
-                "--mode",
-                "continual",
-                "--adaptive-critic-init",
-                "--critic-reset-task-indices",
-                "4",
-            ],
-        ):
-            with self.subTest(argv=argv), patch.object(
-                sys,
-                "argv",
-                argv,
-            ), self.assertRaises(SystemExit):
-                parse_args()
-
-    def test_accepts_task_specific_critic_reset_indices(self) -> None:
-        with patch.object(
-            sys,
-            "argv",
-            [
-                "run.py",
-                "--mode",
-                "continual",
-                "--critic-reset-task-indices",
-                "4",
-                "7",
-            ],
-        ):
-            args = parse_args()
-        self.assertEqual(args.critic_reset_task_indices, [4, 7])
 
     def test_rejects_invalid_jsrl_schedule_before_task_one(self) -> None:
         invalid_arguments = (

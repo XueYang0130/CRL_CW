@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "source": "cw3_v3_schema_route",
+  "routes": [
+    {"task_index": 0, "task_name": "faucet-close-v3", "route": "transfer", "reason": "First task establishes the persistent critic."},
+    {"task_index": 1, "task_name": "shelf-place-v3", "route": "transfer", "reason": "Grasp-and-place composition reuses prior contact-control structure."},
+    {"task_index": 2, "task_name": "peg-unplug-side-v3", "route": "transfer", "reason": "Grasped-object extraction reuses prior contact-control structure."}
+  ]
+}

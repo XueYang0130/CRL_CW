@@ -1,55 +1,62 @@
-# Research Log and Handover
+# Research Journal
 
-For code-level orientation, read [repo_walkthrough.md](repo_walkthrough.md)
-after this document.
+**Working title:** *Remembering Without Restraining: Gradient-Aware Successful Replay for Continual Reinforcement Learning*
 
-## 1. Research Question
+**Current reporting scope:** completed CW10 runs for seeds 1–5.
 
-This project studies continual reinforcement learning on the CW10 Meta-World
-manipulation sequence. The working hypothesis is that transfer and forgetting
-are not uniform over a whole policy or a whole trajectory. Old and new tasks
-contain both cooperative behavioral structure and conflicting behavioral
-structure.
+For a code-level guide, see [repo_walkthrough.md](repo_walkthrough.md).
 
-The proposed direction is to preserve old knowledge selectively:
+## 1. Research Objective
 
-1. collect successful old-policy rollouts;
-2. segment those rollouts into meaningful behavioral stages;
-3. apply Gaussian KL behavior cloning only to selected memory;
-4. use broad, task-specific, and possibly LLM-controlled memory channels so
-   retention is not reduced to a single fixed trajectory filter.
+This project studies the stability-plasticity problem in continual reinforcement
+learning (CRL). When a new task arrives, the actor must remain plastic enough to
+acquire new behavior while retaining policies learned for previous tasks.
+Behavior cloning (BC) is effective for retention, but applying an unrestricted
+BC gradient can dominate or oppose the current-task SAC gradient and delay new
+skill acquisition.
 
-Full BC is not the intended contribution. It is the current empirical oracle.
-The research target is a structured semantic memory method that approaches or
-exceeds Full BC's retention and transfer while using less memory, producing a
-more interpretable mechanism, and exposing where old experience helps or
-interferes.
+The central hypothesis is that old-policy preservation and current-task learning
+should be treated as two interacting optimization objectives rather than as a
+single fixed weighted loss. The proposed approach therefore combines:
 
-## 2. Current Protocol
+1. successful-state replay to retain behaviorally meaningful old-task states;
+2. best-teacher relabelling to give every stored state a consistent target from
+   the strongest saved actor snapshot for that task;
+3. asymmetric gradient projection to protect the current SAC direction from a
+   conflicting BC direction;
+4. adaptive BC norm control to prevent either objective from dominating solely
+   because of gradient scale;
+5. an optional semantic critic route for tasks whose value structure is unlikely
+   to transfer safely.
 
-All currently valid pilot results use:
+The main method is **Success Replay Best Adaptive PCGrad**. The critic-routing
+variant, **Semantic-Routed Frozen Transfer PCGrad**, is currently treated as a
+structured extension rather than a replacement for the main method.
 
-- benchmark: CW10 task order;
-- environment stack: native Meta-World v3 with Gymnasium;
-- observations: full v3 observations, no legacy 12-dimensional truncation;
+## 2. Experimental Protocol
+
+All results in this journal use the same protocol:
+
+- benchmark: CW10;
+- environment API: Meta-World v3 with Gymnasium;
 - reward protocol: `cw10_v1`;
-- `stick-pull-v3`: project-local `v1_compatible` reward wrapper;
-- stick-pull alignment: `stick=obs[4:7]`, `handle=obs[11:14]`,
+- observation protocol: full v3 observations with task identity appended for
+  the multi-head architecture and hidden from the shared representation;
+- `stick-pull-v3`: project-local v1-compatible reward alignment using
+  `stick=obs[4:7]`, `handle=obs[11:14]`, and
   `container=handle+[0.05,0,0]`;
-- installed Meta-World source: not modified;
-- horizon: 200 steps;
-- pilot budget: 500,000 environment steps per task;
-- evaluation interval: 20,000 steps;
-- evaluation: five stochastic episodes and zero deterministic episodes;
-- stochastic success: episode-level success if `info["success"]` is true at
-  any step.
+- horizon: 200 environment steps;
+- training budget: 500,000 environment steps per task;
+- evaluation frequency: every 20,000 steps;
+- online evaluation: five stochastic episodes and zero deterministic episodes;
+- final metric window: mean of the last five final evaluation points;
+- replay batch size: 128;
+- successful reference-memory capacity: 10,000 states per completed task;
+- forward-transfer reference: checkpoint-wise aggregate of the completed
+  independent SAC curves at
+  `outputs/single_task_baselines/cw10_v3_v1_500k_seeds1_2/aggregate/baseline_curves.json`.
 
-The current FT reference is the checkpoint-wise mean of complete pure
-single-task seed 1 and seed 2 runs:
-`outputs/single_task_baselines/cw10_v3_v1_500k_seeds1_2/aggregate/baseline_curves.json`.
-It should be rebuilt with the same aggregation script when more seeds finish.
-
-## 3. CW10 Task Order
+The CW10 sequence is:
 
 1. `hammer-v3`
 2. `push-wall-v3`
@@ -62,21 +69,158 @@ It should be rebuilt with the same aggregation script when more seeds finish.
 9. `window-close-v3`
 10. `peg-unplug-side-v3`
 
-## 4. Semantic Representation
+## 3. Metrics
 
-The active segmenter is `task_aware_v3`. It uses task-aware geometry, motion,
-grasp/contact, progress, success, and a post-success stabilization window.
+### Average performance
 
-### General labels
+For each task, final performance is the mean success over the last five final
+evaluation points. Average performance is the mean of those ten task values:
 
-- `approach`
-- `contact_or_alignment`
-- `manipulation`
-- `finish_or_stabilize`
+\[
+\mathrm{AP}=\frac{1}{10}\sum_{i=1}^{10}p_i^{\mathrm{final}}.
+\]
 
-### Task-specific labels
+Higher is better. Task 0 is included because AP measures final competence over
+the complete sequence.
 
-The segmenter also emits 22 task-specific refinement labels:
+### Average forgetting
+
+For task \(i\), forgetting is its tail performance when task \(i\) finished
+minus its final tail performance after CW10:
+
+\[
+F_i=p_i^{\mathrm{end}}-p_i^{\mathrm{final}}, \qquad
+F=\frac{1}{10}\sum_i F_i.
+\]
+
+Lower is better. Positive values indicate forgetting; negative values indicate
+that later training improved the task. Task 0 is included because it can be
+forgotten after the first task transition.
+
+### Raw forward transfer
+
+For each task after the first, raw forward transfer is the difference between
+the mean active-task learning curve in continual training and the corresponding
+independent SAC learning curve. The reported aggregate averages tasks 1–9:
+
+\[
+\mathrm{FT}_{\mathrm{raw}}
+=\frac{1}{9}\sum_{i=2}^{10}
+\left(\overline{p_i^{\mathrm{CRL}}}-\overline{p_i^{\mathrm{single}}}\right).
+\]
+
+Higher is better. Task 0 is excluded because no previous task exists to provide
+forward transfer.
+
+### Area forward transfer
+
+Area forward transfer compares the complete continual and single-task learning
+curves using a normalized trapezoidal area. It is retained as a diagnostic,
+while raw FT is used in the primary robust comparison because it is easier to
+interpret and less sensitive to near-saturated baseline denominators.
+
+## 4. Methods
+
+### CloneX-SAC
+
+CloneX-SAC is the primary baseline. It uses the same task-conditioned,
+multi-head SAC scaffold and best-return historical-head exploration used by the
+proposed method. At a task transition it samples broad states from the previous
+task replay buffer, evaluates the old actor distribution on those states, and
+adds the resulting `(state, mean, log_std, task_id)` items to cumulative
+reference memory. Gaussian KL behavior cloning regularizes the actor throughout
+subsequent tasks. SAC and BC use the standard joint actor update without PCGrad
+or adaptive norm balancing.
+
+### Success Replay Best Adaptive PCGrad
+
+The main method changes both the memory distribution and the actor-gradient
+integration.
+
+**Successful-state reservoir.** During each task, successful episodes contribute
+states to a reservoir with a capacity of 10,000 states. The states may come from
+different stages of training, but all come from episodes that eventually
+succeeded.
+
+**Best-teacher relabelling.** Actor snapshots are evaluated during training.
+Snapshots are ranked by evaluation success and then return. At task end, the
+best snapshot is temporarily loaded and every reservoir state is relabelled with
+that teacher's Gaussian output:
+
+\[
+(s,\mu_{\mathrm{best}}(s),\log\sigma_{\mathrm{best}}(s),\mathrm{task\_id}).
+\]
+
+This avoids imitating sampled action noise or mixing targets from many historical
+versions of the actor.
+
+**Asymmetric PCGrad.** Let \(g_{\mathrm{SAC}}\) and \(g_{\mathrm{BC}}\) be
+the shared actor-backbone gradients. When their dot product is negative, only
+the BC gradient is projected:
+
+\[
+g'_{\mathrm{BC}}
+=g_{\mathrm{BC}}
+-\frac{g_{\mathrm{BC}}^\top g_{\mathrm{SAC}}}
+{\lVert g_{\mathrm{SAC}}\rVert^2+\epsilon}g_{\mathrm{SAC}}.
+\]
+
+The SAC direction is not projected because current-task acquisition has
+priority.
+
+**Adaptive combination.** After projection and the global BC norm cap, the
+applied BC gradient is rescaled relative to the SAC gradient. Its target
+shared-backbone norm is `0.2` times the SAC norm when the raw objectives are
+compatible and `0.05` times the SAC norm when they conflict. The final shared
+actor direction is:
+
+\[
+g_{\mathrm{actor}}=g_{\mathrm{SAC}}+\alpha_t g'_{\mathrm{BC}},
+\]
+
+where \(\alpha_t\) is computed online from the two gradient norms and is capped
+so that the BC gradient is never amplified beyond its available magnitude.
+The raw cloning coefficient remains `100.0`, but it does not directly determine
+the final BC/SAC ratio after projection and adaptive scaling.
+
+The critic remains the standard transferred multi-head SAC critic. BC updates
+the shared actor backbone and the old task-specific actor heads; it does not
+directly update the critic.
+
+### Semantic-Routed Frozen Transfer PCGrad
+
+This variant keeps the entire actor-side method above and changes only critic
+handling. A frozen offline semantic route marks `stick-pull-v3` as the first
+novel tool-mediated task; all other tasks use critic transfer.
+
+For `stick-pull-v3`, the lifelong transfer critic is snapshotted and frozen. A
+temporary freshly initialized critic supplies the SAC value gradients during
+that task. At task end, the temporary critic is discarded and the unchanged
+transfer critic is restored for later tasks. This tests whether a structurally
+novel value problem should be prevented from overwriting the critic
+representation carried across the sequence.
+
+The routing file is
+`configs/critic_routes/cw10_v3_schema_routes.json`. Routing is decided before
+training from task semantics; it does not inspect evaluation outcomes from the
+run and therefore does not use future performance as an oracle.
+
+### Earlier memory-selection branches
+
+**Full BC** uses complete successful old-task rollouts as reference memory and
+applies the same Gaussian KL actor objective without semantic filtering. It
+served as the successful-experience starting point for the later methods.
+
+**Semantic Local BC** assigns each trajectory state one of four shared labels:
+`approach`, `contact_or_alignment`, `manipulation`, or
+`finish_or_stabilize`. A fixed subset of labels is retained for BC. The labels
+have common names across tasks, but their geometric predicates are task aware.
+
+**Semantic Hybrid BC** augments the four general labels with task-specific
+labels and optional background memory. The `llm_online` branch uses the LLM as
+a controller for the weights of available general segments; it does not create
+future-task memory or expose future trajectories. The active task-aware semantic
+ontology contains these 22 task-specific labels:
 
 ```text
 align_hammer_to_nail
@@ -103,285 +247,253 @@ slide_window_closed
 transport_hammer
 ```
 
-| Task | Possible task-specific labels |
-|---|---|
-| `hammer-v3` | `approach_object`, `establish_hammer_contact`, `grasp_or_engage_object`, `transport_hammer`, `align_hammer_to_nail`, `move_engaged_object`, `complete_and_stabilize` |
-| `push-wall-v3` | `approach_object`, `align_tcp_for_push`, `push_object_toward_target`, `complete_and_stabilize` |
-| `faucet-close-v3` | `approach_object`, `engage_faucet_handle`, `rotate_faucet_closed`, `complete_and_stabilize` |
-| `push-back-v3` | `approach_object`, `align_tcp_for_push`, `push_object_toward_target`, `complete_and_stabilize` |
-| `stick-pull-v3` | `approach_object`, `establish_contact`, `grasp_or_engage_object`, `lift_and_transport_tool`, `align_tool_to_handle`, `move_engaged_object`, `complete_and_stabilize` |
-| `handle-press-side-v3` | `approach_object`, `align_to_side_handle`, `press_handle_down`, `complete_and_stabilize` |
-| `push-v3` | `approach_object`, `align_tcp_for_push`, `push_object_toward_target`, `complete_and_stabilize` |
-| `shelf-place-v3` | `approach_object`, `establish_contact`, `grasp_or_engage_object`, `lift_and_transport_object`, `align_object_to_shelf`, `move_engaged_object`, `complete_and_stabilize` |
-| `window-close-v3` | `approach_object`, `engage_window_handle`, `slide_window_closed`, `complete_and_stabilize` |
-| `peg-unplug-side-v3` | `approach_object`, `establish_contact`, `grasp_or_engage_object`, `grasp_and_pull_peg`, `extract_peg_from_socket`, `move_engaged_object`, `complete_and_stabilize` |
+These semantic branches established the memory-selection problem, but they are
+not included in the primary five-seed result table because the current main
+method is the gradient-aware successful-replay method.
 
-## 5. Completed Pilot Runs
+## 5. Five-Seed Results
 
-These are seed-0 pilot results preserved for reporting continuity. They are
-useful for direction setting, but they are not final statistical claims.
+### Robust aggregate comparison
 
-The FT columns below are pilot values. Older runs were computed before the
-current formal FT rule was locked to exclude task 0 and before the current
-multi-seed single-task aggregate was finalized. Keep them in the running log
-for progress reporting, then recompute the formal FT table after the new
-single-task aggregate and the new continual multi-seed runs finish.
+The table reports the interquartile mean (IQM) and stratified-bootstrap 95%
+confidence interval over seeds 1–5. The implementation follows the `rliable`
+statistical workflow with 50,000 bootstrap resamples. For forgetting, lower is
+better.
 
-| Method | Average Performance | Average Forgetting | Forward Transfer | Area Forward Transfer | Average Return | Status |
-|---|---:|---:|---:|---:|---:|---|
-| Fine-tuning | 0.112 | 0.536 | -0.685 | -0.822 | 31,402.638 | valid lower-bound pilot |
-| ClonEx-SAC | 0.732 | 0.028 | -0.267 | -0.381 | 231,822.926 | valid literature-style baseline pilot |
-| Full BC | 0.904 | 0.048 | 0.239 | 0.210 | 255,417.002 | valid empirical oracle pilot |
-| Semantic Local BC v3 | 0.684 | 0.224 | pending recomputation | pending recomputation | 129,207.431 | valid static semantic pilot |
-| Semantic Hybrid LLM, three-channel | 0.820 | -0.032 | pending recomputation | pending recomputation | 186,332.000 | valid seed-0 proposed-method pilot; needs multi-seed confirmation |
+| Method | Average Performance IQM (95% CI) | Raw FT IQM (95% CI) | Forgetting IQM (95% CI) |
+|---|---:|---:|---:|
+| CloneX-SAC | 0.837 [0.684, 0.897] | 0.135 [0.029, 0.228] | 0.057 [0.023, 0.073] |
+| **Adaptive PCGrad** | **0.879 [0.809, 0.904]** | **0.191 [0.121, 0.231]** | 0.021 [-0.033, 0.061] |
+| Frozen Transfer PCGrad | 0.841 [0.780, 0.889] | 0.169 [0.108, 0.240] | **-0.001 [-0.027, 0.033]** |
 
-Current interpretation:
+Relative to CloneX-SAC, Adaptive PCGrad improves the IQM by `+0.041` in average
+performance and `+0.055` in raw forward transfer, while reducing forgetting by
+`0.036`. Frozen Transfer PCGrad provides the strongest retention result, but it
+does not improve average performance over Adaptive PCGrad.
 
-- Fine-tuning shows severe catastrophic forgetting.
-- ClonEx-SAC gives strong retention but did not dominate transfer in seed 0.
-- Full BC is the strongest completed seed-0 method and shows that successful
-  old-task trajectories contain useful retention and transfer information.
-- Static Semantic Local BC is better than fine-tuning but loses too much old
-  knowledge.
-- The three-channel LLM semantic method improves over static Semantic Local BC
-  in average performance and forgetting, but it has not yet matched Full BC.
-- `stick-pull-v3` remains high variance and should be analyzed across seeds
-  before making a strong method-level claim.
+### Probability of improvement over CloneX-SAC
 
-## 6. Method Definitions
+| Method | Average Performance | Raw FT | Lower Forgetting |
+|---|---:|---:|---:|
+| Adaptive PCGrad | 0.640 [0.240, 1.000] | 0.700 [0.320, 1.000] | 0.760 [0.400, 1.000] |
+| Frozen Transfer PCGrad | 0.540 [0.160, 0.920] | 0.600 [0.200, 0.960] | **0.920 [0.680, 1.000]** |
 
-### Fine-tuning
+The direction of the five-seed evidence favors Adaptive PCGrad on all three
+metrics. However, the AP and raw-FT confidence intervals remain wide and overlap
+the baseline; they should be presented as promising evidence rather than a
+claim of definitive statistical superiority. The clearest current signal is
+the retention advantage of the frozen-transfer variant.
 
-Sequential SAC with no explicit retention, no semantic memory, and no BC.
+### Per-seed main metrics
 
-### ClonEx-SAC
+| Method | Seed | Average Performance | Raw FT | Forgetting | Area FT |
+|---|---:|---:|---:|---:|---:|
+| CloneX-SAC | 1 | 0.884 | 0.260 | 0.068 | 0.603 |
+| CloneX-SAC | 2 | 0.824 | 0.083 | 0.044 | 0.171 |
+| CloneX-SAC | 3 | 0.804 | 0.165 | 0.060 | 0.462 |
+| CloneX-SAC | 4 | 0.904 | 0.157 | 0.012 | 0.364 |
+| CloneX-SAC | 5 | 0.624 | 0.002 | 0.076 | -0.491 |
+| Adaptive PCGrad | 1 | 0.784 | 0.100 | 0.028 | 0.011 |
+| Adaptive PCGrad | 2 | 0.880 | 0.210 | -0.048 | 0.514 |
+| Adaptive PCGrad | 3 | 0.860 | 0.165 | -0.004 | -0.851 |
+| Adaptive PCGrad | 4 | 0.908 | 0.241 | 0.072 | 0.046 |
+| Adaptive PCGrad | 5 | 0.896 | 0.196 | 0.040 | 0.521 |
+| Frozen Transfer PCGrad | 1 | 0.828 | 0.164 | 0.020 | 0.326 |
+| Frozen Transfer PCGrad | 2 | 0.764 | 0.094 | -0.032 | -0.329 |
+| Frozen Transfer PCGrad | 3 | 0.812 | 0.135 | -0.008 | -0.649 |
+| Frozen Transfer PCGrad | 4 | 0.892 | 0.207 | -0.016 | 0.308 |
+| Frozen Transfer PCGrad | 5 | 0.884 | 0.256 | 0.040 | 0.172 |
 
-Multi-head SAC with best-return historical-head exploration and Gaussian KL
-actor cloning. The reimplementation follows the central method components but
-uses PyTorch and the current Meta-World v3 protocol.
+### Final per-task success
 
-### Full BC
+Each value below is first computed as the final five-evaluation mean for one
+run, then averaged over seeds 1–5.
 
-The same multi-head continual scaffold and Gaussian KL actor cloning loss, but
-memory is made from complete successful old-task rollout states. It does not
-semantic-filter those states. Full BC does not use old policies to collect new
-task data by itself; best-return exploration is part of the shared continual
-scaffold when enabled by the method configuration.
+| Task | CloneX-SAC | Adaptive PCGrad | Frozen Transfer PCGrad |
+|---|---:|---:|---:|
+| `hammer-v3` | 0.760 | 0.944 | **0.952** |
+| `push-wall-v3` | 0.504 | **0.736** | 0.712 |
+| `faucet-close-v3` | **1.000** | 0.992 | 0.976 |
+| `push-back-v3` | **0.952** | 0.920 | 0.800 |
+| `stick-pull-v3` | 0.280 | **0.488** | 0.400 |
+| `handle-press-side-v3` | **1.000** | 0.992 | **1.000** |
+| `push-v3` | 0.840 | 0.896 | **0.944** |
+| `shelf-place-v3` | **0.744** | 0.688 | 0.576 |
+| `window-close-v3` | **1.000** | **1.000** | **1.000** |
+| `peg-unplug-side-v3` | **1.000** | **1.000** | **1.000** |
 
-### Semantic Local BC
+Adaptive PCGrad's aggregate gain is not produced by a single task. It improves
+`hammer-v3`, `push-wall-v3`, `stick-pull-v3`, and `push-v3` relative to CloneX,
+while remaining weaker on `push-back-v3` and `shelf-place-v3`. The frozen critic
+route improves retention but does not consistently solve acquisition on
+`stick-pull-v3` or `shelf-place-v3`; value routing alone is therefore not a
+complete explanation of the remaining variance.
 
-Static semantic memory over selected general labels. The current valid version
-uses `task_aware_v3` and ClonEx-style Gaussian KL actor cloning, not MSE.
+## 6. Mechanistic Findings
 
-### Semantic Hybrid BC
+### BC dominance is dynamic rather than source-task specific
 
-Three-channel semantic memory:
+Gradient diagnostics show that no old source task is consistently harmful.
+The same source can have compatible BC minibatches and conflicting BC
+minibatches at different stages and in different seeds. A fixed rule such as
+permanently removing one old task is therefore not supported.
 
-- general channel: selected general labels and normalized weights;
-- background channel: unselected general labels, ratio `0.2G`;
-- task-specific channel: fine-grained labels from completed tasks, ratio
-  `0.2G`.
+The more repeatable failure pattern is a **BC-dominant regime**:
 
-With `llm_online`, GPT-5-mini controls only the general-channel label weights.
-Background and task-specific channels are fixed safeguards. Future-task
-trajectories and future-task task-specific memory are not available during
-training task `k`.
+1. the current-task SAC backbone gradient becomes weak;
+2. the raw BC/SAC norm ratio becomes very large;
+3. old-policy regularization restricts shared-backbone movement;
+4. exploration and critic learning improve slowly;
+5. the SAC signal weakens further relative to BC.
 
-### Gradient-aware BC
+Across existing diagnostics, the raw BC/SAC ratio is strongly associated with
+the inverse SAC gradient norm. This means a very large ratio does not simply
+mean that BC became stronger; it often means that the current task stopped
+producing a useful actor gradient. Adaptive scaling prevents the raw cloning
+coefficient from directly controlling the final update, but it cannot by itself
+guarantee that SAC enters a productive behavioral branch.
 
-Experimental diagnostic only. It projects and caps BC gradients relative to SAC
-gradients in `probe_stickpull_with_memory.py`. It is default-off and should not
-be treated as a completed baseline.
+### PCGrad primarily protects plasticity while replay protects retention
 
-## 7. Forward Transfer Rule
+Successful reference memory supplies the retention target. PCGrad does not
+create that target; it changes how the target is allowed to alter the shared
+actor backbone. The asymmetric projection is most useful when BC and SAC
+conflict, because it removes only the BC component that opposes current-task
+improvement. In compatible regions, the method retains a larger BC contribution.
 
-Formal aggregate forward transfer excludes task 0. The first task has no
-previously learned task, so it cannot measure forward transfer.
+This division explains the current empirical pattern: Adaptive PCGrad improves
+average performance and raw transfer while retaining a lower forgetting IQM
+than CloneX. The result supports gradient-aware integration, but does not prove
+that successful-only memory is universally superior to broad memory.
 
-The reporting plan is:
+### Memory concentration remains a limitation
 
-1. run independent single-task SAC for multiple seeds;
-2. aggregate checkpoint-wise single-task curves into one mean curve per task;
-3. compare each continual seed against the same aggregated single-task curves;
-4. compute each continual seed's FT over tasks 1-9;
-5. report mean and standard deviation over continual seeds.
+Successful-only states are informative but can concentrate the teacher target
+around a narrow old-task behavior. This is especially risky when the new task
+requires a new action phase not represented in old successful trajectories.
+Broader memory can act as a less concentrated regularizer, even when many of its
+states are not individually task-critical. Existing diagnostics motivate this
+interpretation, but the five-seed primary table does not yet isolate memory
+distribution from gradient integration.
 
-Report raw FT, normalized FT, and area FT together. Normalized FT can be
-unstable when the single-task baseline curve is near 1.0, so raw and area
-curves should remain visible.
+### Critic transfer is task dependent
 
-## 8. Immediate Formal Plan
+The frozen-transfer variant shows that preserving a long-term critic can reduce
+forgetting. Its lower average performance shows that semantic novelty is not
+sufficient to choose the best critic route. A reset critic may improve one task's
+local value learning while discarding useful cross-task value structure, and a
+frozen transfer critic can become mismatched to the actor after the routed task.
+The current route should therefore be presented as a critic-side ablation, not
+as the final routing solution.
 
-First run three seeds, then decide whether to extend to five seeds:
+## 7. Current Interpretation
 
-- seeds: 0, 1, 2 initially;
-- methods: `clonex_sac`, `full_bc`, `semantic_local_bc`,
-  `semantic_hybrid_bc`;
-- optional lower-bound: `fine_tuning`;
-- budget: 500,000 steps per task;
-- evaluation: every 20,000 steps, five stochastic episodes;
-- protocol: `v3` + `cw10_v1`;
-- metrics: AP, forgetting, raw FT, normalized FT, area FT, per-task tail-5
-  success, and stick-pull successful-seed count.
+The five-seed evidence supports the following conclusions:
 
-The single-task baseline is currently a two-seed aggregate. Add more seeds
-before the final statistical table because all formal FT claims depend on it.
+1. Successful replay with best-teacher relabelling and adaptive asymmetric
+   PCGrad is competitive with and currently stronger in IQM than CloneX-SAC on
+   average performance, raw forward transfer, and forgetting.
+2. The strongest gain is not merely retention. Adaptive PCGrad also improves
+   the mean active-task learning curve relative to independent SAC.
+3. CloneX-SAC remains a strong and variable baseline. Five seeds are enough to
+   establish the current trend, but not enough for a definitive superiority
+   claim on AP or FT.
+4. Frozen semantic critic routing provides the best forgetting IQM, but trades
+   away some plasticity and does not replace the actor-side main method.
+5. `stick-pull-v3` and `shelf-place-v3` remain the most informative stress tests.
+   They expose acquisition failures that cannot be explained by forgetting
+   alone.
 
-## 9. Current Single-Task Commands
+The paper's defensible contribution is therefore not "PCGrad always beats
+CloneX." It is a structured account of how successful replay, teacher
+consistency, and gradient-scale-aware conflict handling jointly improve the
+stability-plasticity trade-off, supported by a competitive five-seed result and
+mechanistic gradient diagnostics.
 
-Seed 1:
+## 8. Method Evolution
 
-```bash
-cd /Users/xueyang/crl_cw
+The project progressed through the following stages:
 
-caffeinate -dimsu env PYTHONPATH=src .venv/bin/python scripts/run.py \
-  --mode single-batch \
-  --method single_task_baseline \
-  --env-version v3 \
-  --reward-function-version cw10_v1 \
-  --num-tasks 10 \
-  --steps-per-task 500000 \
-  --eval-every 20000 \
-  --stoch-eval-episodes 5 \
-  --det-eval-episodes 0 \
-  --seed 1 \
-  --device cpu \
-  --output-dir outputs/single_task_baselines \
-  --run-name cw10_v3_v1_500k_seed1
-```
+1. **Fine-tuning and CloneX baselines:** established catastrophic forgetting and
+   the strength of actor behavior cloning.
+2. **Full successful-trajectory BC:** showed that old successful behavior can be
+   retained without using CloneX's broad replay-state distribution.
+3. **Semantic Local and Hybrid BC:** tested fixed general segments, task-specific
+   labels, background memory, and online LLM weighting. These experiments showed
+   that semantic selection alone can under-cover retention states and is highly
+   sensitive to segmentation quality.
+4. **Successful replay and best-teacher relabelling:** replaced post-task rollout
+   collection with a successful-state reservoir and consistent teacher targets.
+5. **Adaptive PCGrad:** added SAC-priority projection and norm-relative BC
+   integration, producing the current main result.
+6. **Critic routing:** tested reset, dual-critic, and frozen-transfer mechanisms.
+   The frozen route improved retention but did not dominate the actor-side main
+   method.
+7. **Current diagnostics:** investigate memory coverage, BC cadence, layerwise
+   conflict, hard conflict gates, guide policies, and optimistic n-step replay.
+   These remain analyses or candidate ablations and are not part of the primary
+   five-seed claim.
 
-Seed 2:
+The semantic work remains relevant as a possible memory-value estimator, but
+the present evidence favors using semantics to propose or interpret decisions
+rather than allowing an LLM to directly control optimization without empirical
+feedback.
 
-```bash
-cd /Users/xueyang/crl_cw
+## 9. Next Steps
 
-caffeinate -dimsu env PYTHONPATH=src .venv/bin/python scripts/run.py \
-  --mode single-batch \
-  --method single_task_baseline \
-  --env-version v3 \
-  --reward-function-version cw10_v1 \
-  --num-tasks 10 \
-  --steps-per-task 500000 \
-  --eval-every 20000 \
-  --stoch-eval-episodes 5 \
-  --det-eval-episodes 0 \
-  --seed 2 \
-  --device cpu \
-  --output-dir outputs/single_task_baselines \
-  --run-name cw10_v3_v1_500k_seed2
-```
+### Required for the paper
 
-Aggregate command used after both runs completed:
+1. Complete the statistical table with the same protocol and preserve all run
+   directories, summaries, evaluation curves, and gradient diagnostics.
+2. Run matched ablations that separately remove best-teacher relabelling,
+   PCGrad projection, and adaptive norm scaling.
+3. Compare successful-only and matched-capacity broad memory under the same
+   integration rule to isolate memory distribution from optimization.
+4. Report per-task acquisition curves for `stick-pull-v3` and
+   `shelf-place-v3`, not only final success.
+5. Add compute, memory-state count, and wall-clock comparisons with CloneX-SAC.
 
-```bash
-PYTHONPATH=src .venv/bin/python scripts/aggregate_single_task_seeds.py \
-  --batch-directories \
-    outputs/single_task_baselines/cw10_v3_v1_500k_seed1 \
-    outputs/single_task_baselines/cw10_v3_v1_500k_seed2 \
-  --output-directory \
-    outputs/single_task_baselines/cw10_v3_v1_500k_seeds1_2/aggregate \
-  --tail-size 5
-```
+### Mechanistic analysis
 
-## 10. LLM Audit Requirements
+1. Relate task-stage BC/SAC norm ratio and cosine conflict to acquisition delay.
+2. Measure old-policy KL drift on fixed reference states across task
+   checkpoints.
+3. Test whether gradient concentration or memory feature rank predicts when
+   successful-only replay becomes restrictive.
+4. Distinguish causality from correlation with small checkpoint-based swaps of
+   memory distribution and gradient integration, rather than repeatedly running
+   complete CW10 variants.
 
-For LLM runs:
+### Reporting discipline
 
-- `.env` must contain `OPENAI_API_KEY`;
-- `OPENAI_MODEL` or `--llm-controller-model` should be `gpt-5-mini`;
-- prompt templates live in `prompts/llm_controller/`;
-- exact prompts are stored in `<run_dir>/controller_prompts/`;
-- decisions are stored in `<run_dir>/controller_decisions.json`;
-- invalid JSON, invalid segments, empty memory, API errors, or missing fields
-  fall back to the previous valid general-channel decision;
-- logging failure terminates the run because unauditable LLM runs should not be
-  used as evidence;
-- source-task assertions must remain enabled.
+- Use the last-five-evaluations definition consistently for per-task final
+  success.
+- Include task 0 in average performance and forgetting.
+- Exclude task 0 from aggregate forward transfer.
+- Report IQM, 95% bootstrap confidence intervals, and probability of
+  improvement alongside ordinary means.
+- Do not describe overlapping five-seed AP or FT intervals as conclusive
+  statistical superiority.
+- Keep exploratory methods separate from the primary method table until their
+  protocol is complete.
 
-## 11. Handover Checklist
+## 10. Reproducibility Pointers
 
-Before launching formal runs:
+- Main entry point: `scripts/run.py`
+- Continual loop: `src/training/continual_experiment.py`
+- Main method registration: `methods/success_replay_best_adaptive_pcgrad.py`
+- Frozen critic route: `methods/semantic_routed_frozen_transfer_pcgrad.py`
+- Actor BC and gradient integration: `src/agents/full_bc_agent.py`
+- Frozen-transfer critic implementation:
+  `src/agents/semantic_routed_dual_critic_agent.py`
+- Metric definitions: `src/evaluation/continual_metrics.py`
+- Robust statistics: `scripts/analyze_rliable_cw10.py`
+- Five-seed analysis artifacts:
+  `outputs/analysis/rliable_cw10_seeds1_5/`
 
-- verify `.env` is present locally and not committed;
-- verify run names are unique;
-- keep `cw10_v1` and the stick-pull compatibility wrapper unchanged;
-- use the same single-task aggregate baseline for all continual seeds;
-- do not mix runs from different segmenter versions in one table;
-- keep experimental gradient-aware results separate from formal baseline
-  results.
-
-After every completed run:
-
-- preserve `config.json`, `evaluations.csv`, `task_summaries.csv`,
-  `summary.json`, checkpoints, and LLM audit files;
-- record reference-state counts and fallback rates for semantic methods;
-- inspect stick-pull separately before interpreting aggregate AP;
-- recompute the main table under the current FT rule.
-
-## Gradient-Conflict Evidence Collection
-
-Formal `full_bc` and `clonex_sac` runs now enable read-only gradient
-diagnostics by default. This does not project, rescale, or otherwise modify
-the gradients used for training. It samples one diagnostic point every 500 BC
-updates and performs source-task decomposition only at existing evaluation
-boundaries.
-
-Each run writes incrementally to `gradient_diagnostics/`:
-
-- `gradient_windows.csv`: SAC versus BC loss scale, shared-backbone and
-  full-actor gradient norms, cosine, conflict mass, gradient decomposition,
-  and pre-clip norm/clip scale;
-- `gradient_layers.csv`: the same geometry for each actor-backbone layer;
-- `gradient_task_pairs.csv`: source-old-task versus current-task conflict at
-  evaluation boundaries;
-- `summary.json`: run-wide means, extrema, conflict rate, and sample counts.
-
-Rows include task names, global and task-local steps, evaluation index, raw
-and weighted BC losses, and clipping settings. Memory source IDs are recovered
-from task one-hot vectors; training aborts if current or future task data is
-found in BC memory. A private diagnostic RNG and trajectory-equivalence test
-ensure that logging does not alter parameter updates.
-
-### Gradient-Handling Implementation Order
-
-1. **Asymmetric PCGrad**: project only the harmful BC component against SAC.
-   Test plasticity-priority and stability-priority variants first.
-2. **CAGrad**: optimize a shared direction with explicit conflict aversion;
-   this is the strongest candidate for improving the AP/forgetting/FT trade-off.
-3. **MGDA**: add a Pareto-balanced convex-combination baseline. It may be
-   conservative when gradients are noisy or badly scale-mismatched.
-4. **ConFIG or a comparable modern optimizer**: add only after the first three
-   establish that gradient geometry is the limiting factor.
-
-Expected behavior: plasticity-priority PCGrad should improve new-task learning
-and FT but may increase forgetting; stability-priority projection should do
-the reverse. MGDA should be stable but slower. CAGrad has the best chance of
-moving beyond Full BC's empirical Pareto point, but this requires multi-seed
-evidence rather than a single favorable run.
-
-### Implemented Gradient Methods
-
-`full_bc_norm_balanced` uses the Full BC memory, exploration, KL target, and
-training protocol without change. For shared-backbone gradients `g_sac` and
-`g_bc`, it computes `s = min(1, r*||g_sac||/(||g_bc||+eps))`, with `r=1` by
-default, then applies `s` to all BC actor gradients. The shared norm defines
-cross-task interaction, while the common scale prevents large old-head
-gradients from dominating global clipping.
-
-`full_bc_pcgrad` first checks the shared-backbone dot product. If negative, it
-replaces the shared BC component with
-`g_bc - <g_bc,g_sac>/||g_sac||^2 * g_sac`. Task-specific heads are never
-projected. It then applies the same norm-cap formula to the projected shared BC
-gradient. Comparing these two methods therefore isolates conflict-direction
-removal from gradient-scale control.
-
-Both preserve the final Full BC update `(g_sac + g_bc_applied)/2` and existing
-actor clipping. Diagnostics record the selected strategy, projection events,
-raw and applied BC norms/cosines, and the applied scale.
-
-## References
-
-1. Wolczyk, M., et al. "Disentangling Transfer in Continual Reinforcement
-   Learning." NeurIPS, 2022.
-2. Wolczyk, M., et al. "Continual World: A Robotic Benchmark for Continual
-   Reinforcement Learning." NeurIPS, 2021.
+The current primary experimental statement is: under the fixed CW10 v3/v1,
+500k-per-task protocol, seeds 1–5 show that successful replay with consistent
+best-teacher targets and adaptive SAC-priority PCGrad improves the IQM
+stability-plasticity trade-off relative to CloneX-SAC, while semantic frozen
+critic transfer further reduces forgetting but does not improve overall
+performance.

@@ -181,6 +181,50 @@ class ReplayBuffer:
             ),
         )
 
+    def snapshot(
+        self,
+        *,
+        device: torch.device | str = "cpu",
+    ) -> ReplayBatch:
+        """Return every currently stored transition exactly once.
+
+        The returned tensors are copies, so callers may safely clear or reuse
+        this circular buffer after taking the snapshot. Circular order is not
+        preserved because replay algorithms consume these transitions as an
+        unordered dataset.
+        """
+        if self._size == 0:
+            raise ValueError("Cannot snapshot an empty replay buffer.")
+
+        indices = np.arange(self._size)
+        return ReplayBatch(
+            observations=torch.as_tensor(
+                self._observations[indices].copy(),
+                dtype=torch.float32,
+                device=device,
+            ),
+            actions=torch.as_tensor(
+                self._actions[indices].copy(),
+                dtype=torch.float32,
+                device=device,
+            ),
+            rewards=torch.as_tensor(
+                self._rewards[indices].copy(),
+                dtype=torch.float32,
+                device=device,
+            ),
+            next_observations=torch.as_tensor(
+                self._next_observations[indices].copy(),
+                dtype=torch.float32,
+                device=device,
+            ),
+            terminated=torch.as_tensor(
+                self._terminated[indices].copy(),
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+
     def clear(self) -> None:
         """Remove all stored transitions without reallocating arrays.
 

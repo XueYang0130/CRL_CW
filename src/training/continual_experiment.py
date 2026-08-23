@@ -15,7 +15,7 @@ from agents.gradient_diagnostics import (
     GRADIENT_TASK_PAIR_FIELDS,
     GRADIENT_WINDOW_FIELDS,
 )
-from envs import get_cw10_tasks, make_cw_env
+from envs import canonical_cw10_task_name, get_continual_task_sequence, make_cw_env
 from evaluation import EvaluationConfig, SACEvaluator, summarize_continual_run
 from methods import (
     bc_gradient_strategy_for_method,
@@ -58,21 +58,13 @@ from training.llm_policy_prior_controller import (
     no_transfer_decision,
     resolve_prior_exploration,
 )
-from training.llm_broader_replay_controller import (
-    build_broader_replay_prompt,
-    call_broader_replay_controller,
-    random_baseline_decision,
-    random_fallback_decision,
-)
 from training.implicit_policy_prior import (
     PriorInitializationResult,
     collect_reset_observations,
     initialize_actor_head_from_source,
 )
-from training.success_replay import BroaderStateReservoir, SuccessfulStateReservoir
+from training.success_replay import SuccessfulStateReservoir
 from training.bc_progress_gate import BCProgressGate
-from training.critic_selection import CriticBank, CriticSelectionResult, select_best_critic
-from training.critic_routing import CriticRoute, load_critic_route_manifest
 from utils import append_csv_rows, save_sac_checkpoint, write_csv, write_json
 
 
@@ -100,6 +92,11 @@ CW10_EVAL_FIELDS = [
     "q2_mean",
     "q_target_mean",
     "log_prob_mean",
+    "ensemble_critic_loss",
+    "q_ensemble_std_mean",
+    "td_error_abs_mean",
+    "priority_beta",
+    "importance_weight_mean",
     "bc_progress_score",
     "bc_progress_multiplier",
     "bc_progress_next_multiplier",
@@ -125,17 +122,7 @@ CW10_TASK_SUMMARY_FIELDS = [
     "curriculum_transitions",
     "reference_success_episodes",
     "reference_states",
-    "successful_reference_states",
     "success_replay_seen_states",
-    "broader_replay_selector",
-    "broader_replay_ratio",
-    "broader_replay_target_states",
-    "broader_replay_states",
-    "broader_replay_quota_filled",
-    "broader_replay_candidate_counts",
-    "broader_replay_selected_bins",
-    "broader_replay_selection_source",
-    "broader_replay_selection_reason",
     "background_reference_states",
     "task_specific_reference_states",
     "semantic_segment_scheme",
@@ -160,18 +147,6 @@ CW10_TASK_SUMMARY_FIELDS = [
     "policy_prior_final_kl",
     "bc_task_schedule_reason_codes",
     "bc_task_schedule_reason",
-    "critic_selection_source",
-    "critic_selection_task_index",
-    "critic_selection_final_loss",
-    "critic_route",
-    "critic_route_source",
-    "critic_route_reason",
-    "background_critic_updates",
-    "ssde_gate_density",
-    "ssde_overlap_ratio",
-    "ssde_beta_mean",
-    "ssde_distillation_updates",
-    "ssde_reactivated_neurons",
 ]
 
 
@@ -417,7 +392,11 @@ def normalize_exploration_strategy(strategy: str) -> str:
     return aliases.get(strategy, strategy)
 
 
-def load_baseline_curves(path: str | None) -> list[list[float]] | None:
+def load_baseline_curves(
+    path: str | None,
+    *,
+    tasks: list[str] | None = None,
+) -> list[list[float]] | None:
     if path is None:
         return None
     with Path(path).open("r", encoding="utf-8") as file:
@@ -432,7 +411,27 @@ def load_baseline_curves(path: str | None) -> list[list[float]] | None:
             "Baseline curve file must contain a list-valued "
             "stochastic_success_curves field."
         )
-    return curves
+    baseline_tasks = payload.get("tasks")
+    if tasks is None or baseline_tasks is None:
+        return curves
+    if not isinstance(baseline_tasks, list) or len(baseline_tasks) != len(curves):
+        raise ValueError(
+            "Baseline curve tasks must be a list aligned with stochastic_success_curves."
+        )
+    curves_by_task: dict[str, list[float]] = {}
+    for task_name, curve in zip(baseline_tasks, curves, strict=True):
+        if not isinstance(task_name, str):
+            raise ValueError("Baseline curve task names must be strings.")
+        canonical_name = canonical_cw10_task_name(task_name)
+        if canonical_name in curves_by_task:
+            raise ValueError(f"Duplicate baseline curve task {task_name!r}.")
+        curves_by_task[canonical_name] = curve
+    try:
+        return [curves_by_task[canonical_cw10_task_name(task)] for task in tasks]
+    except KeyError as exc:
+        raise ValueError(
+            f"Baseline curves do not contain continual task {exc.args[0]!r}."
+        ) from exc
 
 
 def validate_baseline_curves_for_run(
@@ -470,6 +469,16 @@ def validate_baseline_curves_for_run(
             )
 
 
+def unique_task_metric_labels(tasks: list[str]) -> list[str]:
+    """Keep legacy names unless a repeated environment needs position identity."""
+
+    counts = {task: tasks.count(task) for task in set(tasks)}
+    return [
+        task if counts[task] == 1 else f"{task}@position_{index}"
+        for index, task in enumerate(tasks)
+    ]
+
+
 def select_best_return_guide(
     *,
     agent: SACAgent,
@@ -485,15 +494,26 @@ def select_best_return_guide(
     for head_index in range(task_index):
         returns = []
         for episode_index in range(episodes_per_head):
-            reset_result = env.reset(seed=seed + head_index * episodes_per_head + episode_index)
+            if getattr(agent, "official_recall_cumulative_guide_mask", False):
+                reset_result = env.reset()
+            else:
+                reset_result = env.reset(
+                    seed=seed + head_index * episodes_per_head + episode_index
+                )
             observation = reset_result[0] if isinstance(reset_result, tuple) else reset_result
             episode_return = 0.0
             for _ in range(max_episode_steps):
-                action = agent.select_guide_action(
-                    observation,
-                    guide_task_index=head_index,
-                    deterministic=False,
-                )
+                if getattr(agent, "official_recall_cumulative_guide_mask", False):
+                    action = agent.select_official_recall_guide_action(
+                        observation,
+                        head_index=head_index,
+                    )
+                else:
+                    action = agent.select_guide_action(
+                        observation,
+                        guide_task_index=head_index,
+                        deterministic=False,
+                    )
                 step_result = env.step(action)
                 if len(step_result) == 5:
                     observation, reward, terminated, truncated, _ = step_result
@@ -628,6 +648,7 @@ def evaluate_all_tasks(
             env_version=env_version,
             reward_function_version=reward_function_version,
             num_task_ids=num_task_ids,
+            task_id_index=eval_task_index,
         )
         deterministic = None
         if det_eval_episodes > 0:
@@ -676,6 +697,11 @@ def evaluate_all_tasks(
                 "q2_mean": "" if update_metrics is None else update_metrics.get("q2_mean", ""),
                 "q_target_mean": "" if update_metrics is None else update_metrics.get("q_target_mean", ""),
                 "log_prob_mean": "" if update_metrics is None else update_metrics.get("log_prob_mean", ""),
+                "ensemble_critic_loss": "" if update_metrics is None else update_metrics.get("ensemble_critic_loss", ""),
+                "q_ensemble_std_mean": "" if update_metrics is None else update_metrics.get("q_ensemble_std_mean", ""),
+                "td_error_abs_mean": "" if update_metrics is None else update_metrics.get("td_error_abs_mean", ""),
+                "priority_beta": "" if update_metrics is None else update_metrics.get("priority_beta", ""),
+                "importance_weight_mean": "" if update_metrics is None else update_metrics.get("importance_weight_mean", ""),
                 "elapsed_seconds": time.time() - started_at,
             }
         )
@@ -696,6 +722,7 @@ def collect_successful_reference_observations(
     max_attempts: int,
     seed: int,
     num_task_ids: int,
+    task_id_index: int,
 ) -> tuple[np.ndarray, int]:
     if episodes <= 0:
         raise ValueError("full_bc_reference_episodes must be positive.")
@@ -709,6 +736,7 @@ def collect_successful_reference_observations(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     kept_observations: list[np.ndarray] = []
     successful_episodes = 0
@@ -748,6 +776,7 @@ def collect_successful_reference_observations(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     try:
         observation_dim = int(empty_env.observation_space.shape[0])
@@ -774,6 +803,7 @@ def collect_segmented_reference_observations(
     segment_scheme: str = "heuristic_v1",
     post_success_steps: int = 10,
     num_task_ids: int = 10,
+    task_id_index: int | None = None,
 ) -> tuple[np.ndarray, int, int, int]:
     if not allowed_segments:
         raise ValueError("semantic_local_bc requires at least one semantic segment.")
@@ -812,6 +842,7 @@ def collect_segmented_reference_observations(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     selected_observations: list[np.ndarray] = []
     background_observations: list[np.ndarray] = []
@@ -930,6 +961,7 @@ def collect_segmented_reference_observations(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     try:
         observation_dim = int(empty_env.observation_space.shape[0])
@@ -957,6 +989,7 @@ def collect_reference_payloads_by_segment(
     segment_scheme: str,
     post_success_steps: int,
     num_task_ids: int,
+    task_id_index: int,
 ) -> tuple[
     dict[str, dict[str, np.ndarray]],
     dict[str, dict[str, np.ndarray]],
@@ -970,6 +1003,7 @@ def collect_reference_payloads_by_segment(
         env_version=env_version,
         reward_function_version=reward_function_version,
         num_task_ids=num_task_ids,
+        task_id_index=task_id_index,
     )
     segment_observations: dict[str, list[np.ndarray]] = {
         segment: [] for segment in SEGMENT_ORDER
@@ -1085,8 +1119,9 @@ def collect_reference_payloads_by_segment(
 
 def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
     seed_global_rngs(args.seed)
-    tasks = get_cw10_tasks(args.env_version)[: args.sequence_task_count]
-    critic_reset_task_indices = set(getattr(args, "critic_reset_task_indices", []) or [])
+    tasks = get_continual_task_sequence(args.task_sequence, args.env_version)
+    if args.task_sequence == "cw10":
+        tasks = tasks[: args.sequence_task_count]
     started_at = time.time()
     method = get_method(args.method)
     append_task_id = method.append_task_id
@@ -1099,6 +1134,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         env_version=args.env_version,
         reward_function_version=args.reward_function_version,
         num_task_ids=len(tasks),
+        task_id_index=0,
     )
     observation_dim = first_env.observation_space.shape[0]
     action_dim = first_env.action_space.shape[0]
@@ -1112,6 +1148,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         env_version=args.env_version,
         reward_function_version=args.reward_function_version,
         num_task_ids=len(tasks),
+        task_id_index=0,
     )
     agent = method.build_agent(
         args=args,
@@ -1161,12 +1198,22 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         raise RuntimeError(
             f"Method {args.method} does not support actor gradient diagnostics."
         )
-    replay_buffer = ReplayBuffer(
+    replay_buffer = method.build_replay_buffer(
+        args=args,
         observation_dim=observation_dim,
         action_dim=action_dim,
-        capacity=args.replay_size,
-        seed=args.seed,
     )
+    for attribute, expected in (
+        ("observation_dim", observation_dim),
+        ("action_dim", action_dim),
+        ("capacity", args.replay_size),
+    ):
+        actual = getattr(replay_buffer, attribute, None)
+        if actual != expected:
+            raise RuntimeError(
+                f"Method replay buffer {attribute} mismatch: "
+                f"expected={expected}, actual={actual}."
+            )
 
     config = vars(args).copy()
     config["tasks"] = tasks
@@ -1180,22 +1227,6 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
     global_step = 0
     cumulative_gradient_updates = 0
     evaluation_index = 0
-    critic_bank = CriticBank() if getattr(args, "adaptive_critic_init", False) else None
-    critic_routes: dict[int, CriticRoute] | None = None
-    routed_critic_methods = {
-        "semantic_routed_dual_critic_pcgrad",
-        "semantic_routed_frozen_transfer_pcgrad",
-        "semantic_routed_frozen_transfer_mixed80_pcgrad",
-    }
-    if args.method in routed_critic_methods:
-        if not args.critic_route_manifest:
-            raise ValueError(
-                f"{args.method} requires --critic-route-manifest."
-            )
-        critic_routes = load_critic_route_manifest(
-            args.critic_route_manifest,
-            tasks=tasks,
-        )
     segment_selection_manifest = (
         load_segment_selection_manifest(args.segment_selection_manifest)
         if args.segment_selection_manifest
@@ -1251,7 +1282,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             GRADIENT_TASK_PAIR_FIELDS,
             diagnostic_rows["task_pairs"],
         )
-    baseline_curves = load_baseline_curves(args.baseline_curves)
+    baseline_curves = load_baseline_curves(args.baseline_curves, tasks=tasks)
     validate_baseline_curves_for_run(
         baseline_curves,
         task_count=len(tasks),
@@ -1286,16 +1317,8 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             prior_api_key = read_api_key(args.llm_controller_api_key_env)
         except Exception as error:
             prior_api_key_error = f"{type(error).__name__}: {error}"
-    broader_replay_api_key = None
-    broader_replay_api_key_error: str | None = None
-    if method.broader_replay_selector == "llm":
-        try:
-            broader_replay_api_key = read_api_key(args.llm_controller_api_key_env)
-        except Exception as error:
-            broader_replay_api_key_error = f"{type(error).__name__}: {error}"
 
     for task_index, task_name in enumerate(tasks):
-        critic_route = None if critic_routes is None else critic_routes[task_index]
         prior_decision: LLMPolicyPriorDecision | None = None
         prior_result: PriorInitializationResult | None = None
         active_progress_gate = global_progress_gate
@@ -1403,97 +1426,27 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         active_reference_states = 0
         active_background_reference_states = 0
         active_task_specific_reference_states = 0
-        success_replay_capacity = int(
-            round(args.episodic_memory_per_task * (1.0 - method.broader_replay_ratio))
-        )
-        broader_replay_capacity = args.episodic_memory_per_task - success_replay_capacity
         success_replay = (
             SuccessfulStateReservoir(
-                # Keep enough successful candidates to backfill a broad quota
-                # that cannot be filled, while preserving the nominal 80/20
-                # split whenever both pools have enough states.
-                capacity=(
-                    args.episodic_memory_per_task
-                    if method.broader_replay_selector is not None
-                    else success_replay_capacity
-                ),
+                capacity=args.episodic_memory_per_task,
                 observation_dim=observation_dim,
                 seed=args.seed + 600_000 + task_index,
             )
             if method.success_replay_teacher is not None
             else None
         )
-        broader_replay = (
-            BroaderStateReservoir(
-                # An underfilled success quota may require more than the
-                # nominal 20% broad allocation at task end.
-                capacity_per_bin=args.episodic_memory_per_task,
-                observation_dim=observation_dim,
-                seed=args.seed + 650_000 + task_index,
-            )
-            if method.broader_replay_selector is not None
-            else None
-        )
-        if method.broader_replay_selector is not None and (
-            success_replay_capacity <= 0 or broader_replay_capacity <= 0
-        ):
-            raise RuntimeError("Broader replay requires non-empty success and broader quotas.")
         best_teacher_state: dict[str, torch.Tensor] | None = None
         best_teacher_score = (float("-inf"), float("-inf"))
         best_teacher_step: int | None = None
         effective_exploration_strategy = normalize_exploration_strategy(
             args.exploration_strategy
         )
-        if critic_route is not None:
-            if not hasattr(agent, "configure_critic_route"):
-                raise RuntimeError("Configured method does not support critic routing.")
-            agent.configure_critic_route(critic_route.route)
         agent.on_task_start(
             task_index=task_index,
             replay_buffer=replay_buffer,
         )
         if task_index > 0 and args.reset_buffer_on_task_change:
             replay_buffer.clear()
-        env = make_cw_env(
-            task_name,
-            seed=args.seed + task_index,
-            max_episode_steps=args.max_episode_steps,
-            append_task_id=append_task_id,
-            env_version=args.env_version,
-            reward_function_version=args.reward_function_version,
-            num_task_ids=len(tasks),
-        )
-        critic_selection_result: CriticSelectionResult | None = None
-        if critic_route is not None:
-            print(
-                f"[critic-route] task={task_name} route={critic_route.route} "
-                f"source={critic_route.source}"
-            )
-        elif task_index > 0 and critic_bank is not None:
-            critic_selection_result = select_best_critic(
-                agent=agent,
-                env=env,
-                critic_bank=critic_bank,
-                current_task_index=task_index,
-                probe_transitions=args.critic_probe_transitions,
-                warmup_updates=args.critic_warmup_updates,
-                batch_size=args.batch_size,
-                max_episode_steps=args.max_episode_steps,
-                seed=args.seed + 90_000 + task_index * 1_000,
-            )
-            print(
-                f"[adaptive-critic] task={task_name} "
-                f"selected={critic_selection_result.selected_source} "
-                f"loss={critic_selection_result.final_td_loss:.1f}"
-            )
-        elif task_index > 0 and (
-            getattr(args, "reset_critic_on_task_change", False)
-            or task_index in critic_reset_task_indices
-        ):
-            agent.reset_critics()
-            print(f"[critic-init] task={task_name} mode=reset")
-        elif task_index > 0:
-            print(f"[critic-init] task={task_name} mode=transfer")
         if task_index > 0 and args.reset_optimizer_on_task_change:
             agent.rebuild_optimizer()
         if task_index > 0 and method.transfer_alpha:
@@ -1622,6 +1575,17 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         )
         actual_exploration_strategy = (
             "random" if exploration_strategy is None else exploration_strategy
+        )
+
+        env = make_cw_env(
+            task_name,
+            seed=args.seed + task_index,
+            max_episode_steps=args.max_episode_steps,
+            append_task_id=append_task_id,
+            env_version=args.env_version,
+            reward_function_version=args.reward_function_version,
+            num_task_ids=len(tasks),
+            task_id_index=task_index,
         )
         if method.llm_prior_initialization:
             if task_index == 0:
@@ -1799,6 +1763,10 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 reseed_global_rng=(task_index == 0),
                 guide_head_index=guide_head_index,
                 guide_steps=guide_steps,
+                policy_from_start=bool(
+                    selected_guide is not None
+                    and method.policy_from_start_after_guide
+                ),
             ),
         )
         curriculum_eval_env = (
@@ -1810,6 +1778,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 env_version=args.env_version,
                 reward_function_version=args.reward_function_version,
                 num_task_ids=len(tasks),
+                task_id_index=task_index,
             )
             if guide_head_index is not None
             else None
@@ -1925,7 +1894,8 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     best_teacher_state = clone_module_state(agent.actor)
                     best_teacher_step = task_step
             print(
-                f"[cw10] task={task_name} step={task_step:,}/{args.steps_per_task:,} "
+                f"[{args.task_sequence}] task={task_name} "
+                f"step={task_step:,}/{args.steps_per_task:,} "
                 f"success={active_row['stochastic_success_rate']:.3f} "
                 f"return={active_row['stochastic_average_return']:.3f}"
             )
@@ -2169,21 +2139,10 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                             }
                         )
 
-        def record_completed_episode(
-            observations: tuple[np.ndarray, ...],
-            succeeded: bool,
-        ) -> None:
-            if success_replay is not None:
-                success_replay.add_episode(observations, succeeded)
-            if broader_replay is not None:
-                broader_replay.add_episode(observations, succeeded)
-
         training_summary = trainer.train(
             step_callback=evaluate,
             completed_episode_callback=(
-                None
-                if success_replay is None and broader_replay is None
-                else record_completed_episode
+                None if success_replay is None else success_replay.add_episode
             ),
         )
         if curriculum_eval_env is not None:
@@ -2196,135 +2155,16 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         )
         reference_success_episodes = None
         reference_states = None
-        successful_reference_states = None
         background_reference_states = None
         task_specific_reference_states = None
         collected_segment_states = None
-        broader_replay_target_states = None
-        broader_replay_states = None
-        broader_replay_quota_filled = None
-        broader_replay_candidate_counts = None
-        broader_replay_selected_bins = None
-        broader_replay_selection_source = None
-        broader_replay_selection_reason = None
         if success_replay is not None:
             if not isinstance(agent, FullBehaviorCloningSACAgent):
                 raise RuntimeError(
                     "Successful replay relabeling requires FullBehaviorCloningSACAgent."
                 )
-            all_success_observations = success_replay.observations()
-            reference_observations = success_replay.observations(
-                capacity=success_replay_capacity,
-                seed=args.seed + 655_000 + task_index,
-            )
+            reference_observations = success_replay.observations()
             reference_success_episodes = success_replay.successful_episodes
-            successful_reference_states = int(reference_observations.shape[0])
-            broader_observations = np.empty(
-                (0, observation_dim), dtype=np.float32
-            )
-            if broader_replay is not None:
-                broader_replay_target_states = (
-                    args.episodic_memory_per_task - successful_reference_states
-                )
-                candidate_counts = broader_replay.counts()
-                broader_replay_candidate_counts = json.dumps(
-                    candidate_counts, sort_keys=True
-                )
-                if method.broader_replay_selector == "llm":
-                    prompt_path: Path | None = None
-                    try:
-                        prompt = build_broader_replay_prompt(
-                            task_name=task_name,
-                            available_counts=candidate_counts,
-                            prompt_dir=args.llm_broader_replay_prompt_dir,
-                        )
-                        prompt_dir = run_dir / "broader_replay_prompts"
-                        prompt_dir.mkdir(parents=True, exist_ok=True)
-                        prompt_path = prompt_dir / f"task_{task_index:02d}_{task_name}.txt"
-                        prompt_path.write_text(prompt, encoding="utf-8")
-                        if broader_replay_api_key is None:
-                            raise RuntimeError(
-                                "LLM broader-replay API key was not loaded: "
-                                f"{broader_replay_api_key_error or 'unknown error'}"
-                            )
-                        broader_decision = call_broader_replay_controller(
-                            api_key=broader_replay_api_key,
-                            model=args.llm_controller_model,
-                            prompt=prompt,
-                            max_output_tokens=args.llm_controller_max_output_tokens,
-                        )
-                    except Exception as error:
-                        broader_decision = random_fallback_decision(
-                            f"Controller failure: {type(error).__name__}: {error}"
-                        )
-                else:
-                    broader_decision = random_baseline_decision(
-                        "Random broader replay baseline."
-                    )
-                selected_candidate_count = sum(
-                    candidate_counts[label] for label in broader_decision.selected_bins
-                )
-                total_candidate_count = sum(candidate_counts.values())
-                if (
-                    method.broader_replay_selector == "llm"
-                    and selected_candidate_count < broader_replay_target_states
-                    and total_candidate_count >= broader_replay_target_states
-                ):
-                    broader_decision = random_fallback_decision(
-                        "LLM-selected bins did not contain enough candidates "
-                        f"for the broader quota ({selected_candidate_count}/"
-                        f"{broader_replay_target_states}); using all temporal bins."
-                    )
-                if method.broader_replay_selector == "llm":
-                    append_controller_log(
-                        run_dir / "broader_replay_decisions.json",
-                        {
-                            "task_index": task_index,
-                            "task_name": task_name,
-                            "model": args.llm_controller_model,
-                            "prompt_path": (
-                                None
-                                if prompt_path is None
-                                else str(prompt_path.relative_to(run_dir))
-                            ),
-                            "candidate_counts": candidate_counts,
-                            "selected_bins": list(broader_decision.selected_bins),
-                            "source": broader_decision.source,
-                            "reason": broader_decision.reason,
-                            "raw_response_text": broader_decision.raw_response_text,
-                        },
-                    )
-                broader_replay_selected_bins = json.dumps(
-                    list(broader_decision.selected_bins)
-                )
-                broader_replay_selection_source = broader_decision.source
-                broader_replay_selection_reason = broader_decision.reason
-                broader_observations = broader_replay.observations(
-                    selected_bins=broader_decision.selected_bins,
-                    capacity=broader_replay_target_states,
-                    seed=args.seed + 660_000 + task_index,
-                )
-                broader_replay_states = int(broader_observations.shape[0])
-                broader_replay_quota_filled = (
-                    0.0
-                    if broader_replay_target_states <= 0
-                    else broader_replay_states / broader_replay_target_states
-                )
-                # If failed episodes cannot fill the broad quota, use extra
-                # successful states so methods retain a matched total memory
-                # budget whenever the combined candidate pools permit it.
-                success_target = min(
-                    int(all_success_observations.shape[0]),
-                    args.episodic_memory_per_task - broader_replay_states,
-                )
-                reference_observations = success_replay.observations(
-                    capacity=success_target,
-                    seed=args.seed + 655_000 + task_index,
-                )
-                successful_reference_states = int(reference_observations.shape[0])
-            reference_observations = np.concatenate(
-                (reference_observations, broader_observations), axis=0
-            )
             reference_states = int(reference_observations.shape[0])
             if reference_states > 0:
                 if (
@@ -2378,6 +2218,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     max_attempts=args.full_bc_reference_max_attempts,
                     seed=args.seed + 40_000 + task_index * 1_000,
                     num_task_ids=len(tasks),
+                    task_id_index=task_index,
                 )
                 background_reference_states = 0
                 task_specific_reference_states = 0
@@ -2397,6 +2238,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     segment_scheme=args.semantic_segment_scheme,
                     post_success_steps=args.semantic_post_success_steps,
                     num_task_ids=len(tasks),
+                    task_id_index=task_index,
                 )
                 for segment, payload in per_segment_payloads.items():
                     if payload["observations"].shape[0] > 0:
@@ -2444,6 +2286,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     segment_scheme=args.semantic_segment_scheme,
                     post_success_steps=args.semantic_post_success_steps,
                     num_task_ids=len(tasks),
+                    task_id_index=task_index,
                 )
                 for segment, payload in per_segment_payloads.items():
                     if payload["observations"].shape[0] > 0:
@@ -2514,6 +2357,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     segment_scheme=args.semantic_segment_scheme,
                     post_success_steps=args.semantic_post_success_steps,
                     num_task_ids=len(tasks),
+                    task_id_index=task_index,
                 )
                 for segment, payload in per_segment_payloads.items():
                     if payload["observations"].shape[0] > 0:
@@ -2532,8 +2376,6 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
             segment_selection = None
             task_specific_selection = None
         active_task_success_curves.append(task_curve_success)
-        if critic_bank is not None:
-            critic_bank.save(agent)
         save_sac_checkpoint(
             agent=agent,
             path=run_dir / "checkpoints" / f"task_{task_index}.pt",
@@ -2553,14 +2395,10 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     None,
                 ),
                 "bc_cagrad_alpha": getattr(agent, "bc_cagrad_alpha", None),
-                "critic_route": None if critic_route is None else critic_route.route,
-                "critic_route_source": None if critic_route is None else critic_route.source,
-                "critic_route_reason": None if critic_route is None else critic_route.reason,
             },
         )
         task_summary_rows.append(
             {
-                **agent.task_diagnostics(),
                 "task_index": task_index,
                 "task_name": task_name,
                 "exploration_strategy": (
@@ -2587,21 +2425,11 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 "curriculum_transitions": json.dumps(curriculum_transitions),
                 "reference_success_episodes": reference_success_episodes,
                 "reference_states": reference_states,
-                "successful_reference_states": successful_reference_states,
                 "success_replay_seen_states": (
                     None
                     if success_replay is None
                     else success_replay.seen_successful_states
                 ),
-                "broader_replay_selector": method.broader_replay_selector,
-                "broader_replay_ratio": method.broader_replay_ratio,
-                "broader_replay_target_states": broader_replay_target_states,
-                "broader_replay_states": broader_replay_states,
-                "broader_replay_quota_filled": broader_replay_quota_filled,
-                "broader_replay_candidate_counts": broader_replay_candidate_counts,
-                "broader_replay_selected_bins": broader_replay_selected_bins,
-                "broader_replay_selection_source": broader_replay_selection_source,
-                "broader_replay_selection_reason": broader_replay_selection_reason,
                 "background_reference_states": background_reference_states,
                 "task_specific_reference_states": task_specific_reference_states,
                 "semantic_segment_scheme": (
@@ -2682,24 +2510,6 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 "bc_task_schedule_reason": (
                     None if schedule_decision is None else schedule_decision.reason
                 ),
-                "critic_selection_source": (
-                    None if critic_selection_result is None
-                    else critic_selection_result.selected_source
-                ),
-                "critic_selection_task_index": (
-                    None if critic_selection_result is None
-                    else critic_selection_result.selected_task_index
-                ),
-                "critic_selection_final_loss": (
-                    None if critic_selection_result is None
-                    else critic_selection_result.final_td_loss
-                ),
-                "critic_route": None if critic_route is None else critic_route.route,
-                "critic_route_source": None if critic_route is None else critic_route.source,
-                "critic_route_reason": None if critic_route is None else critic_route.reason,
-                "background_critic_updates": int(
-                    getattr(agent, "background_critic_updates", 0)
-                ),
             }
         )
         env.close()
@@ -2751,6 +2561,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         tail_size=args.tail_size,
     )
     average_return = sum(sum(row) / len(row) for row in final_return_rows) / len(final_return_rows)
+    task_metric_labels = unique_task_metric_labels(tasks)
     summary_payload = {
         "method": args.method,
         "tasks": tasks,
@@ -2761,23 +2572,23 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         "raw_forward_transfer": metrics["raw_forward_transfer"],
         "area_forward_transfer": metrics["area_forward_transfer"],
         "forward_transfer_available": metrics["forward_transfer_available"],
-        "final_per_task_success": dict(zip(tasks, metrics["final_per_task"], strict=True)),
-        "end_of_task_per_task": dict(zip(tasks, metrics["end_of_task_per_task"], strict=True)),
-        "forgetting_per_task": dict(zip(tasks, metrics["forgetting_per_task"], strict=True)),
+        "final_per_task_success": dict(zip(task_metric_labels, metrics["final_per_task"], strict=True)),
+        "end_of_task_per_task": dict(zip(task_metric_labels, metrics["end_of_task_per_task"], strict=True)),
+        "forgetting_per_task": dict(zip(task_metric_labels, metrics["forgetting_per_task"], strict=True)),
         "raw_forward_transfer_per_task": (
             None
             if metrics["raw_forward_transfer_per_task"][0] is None
-            else dict(zip(tasks, metrics["raw_forward_transfer_per_task"], strict=True))
+            else dict(zip(task_metric_labels, metrics["raw_forward_transfer_per_task"], strict=True))
         ),
         "normalized_forward_transfer_per_task": (
             None
             if metrics["normalized_forward_transfer_per_task"][0] is None
-            else dict(zip(tasks, metrics["normalized_forward_transfer_per_task"], strict=True))
+            else dict(zip(task_metric_labels, metrics["normalized_forward_transfer_per_task"], strict=True))
         ),
         "area_forward_transfer_per_task": (
             None
             if metrics["area_forward_transfer_per_task"][0] is None
-            else dict(zip(tasks, metrics["area_forward_transfer_per_task"], strict=True))
+            else dict(zip(task_metric_labels, metrics["area_forward_transfer_per_task"], strict=True))
         ),
         "run_directory": str(run_dir),
         "elapsed_seconds": time.time() - started_at,
