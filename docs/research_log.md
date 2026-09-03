@@ -257,7 +257,7 @@ method is the gradient-aware successful-replay method.
 
 The table reports the interquartile mean (IQM) and stratified-bootstrap 95%
 confidence interval over seeds 1–5. The implementation follows the `rliable`
-statistical workflow with 50,000 bootstrap resamples. For forgetting, lower is
+statistical workflow with 10,000 bootstrap resamples. For forgetting, lower is
 better.
 
 | Method | Average Performance IQM (95% CI) | Raw FT IQM (95% CI) | Forgetting IQM (95% CI) |
@@ -275,7 +275,7 @@ does not improve average performance over Adaptive PCGrad.
 
 | Method | Average Performance | Raw FT | Lower Forgetting |
 |---|---:|---:|---:|
-| Adaptive PCGrad | 0.640 [0.240, 1.000] | 0.700 [0.320, 1.000] | 0.760 [0.400, 1.000] |
+| Adaptive PCGrad | 0.640 [0.240, 1.000] | 0.700 [0.320, 1.000] | 0.760 [0.360, 1.000] |
 | Frozen Transfer PCGrad | 0.540 [0.160, 0.920] | 0.600 [0.200, 0.960] | **0.920 [0.680, 1.000]** |
 
 The direction of the five-seed evidence favors Adaptive PCGrad on all three

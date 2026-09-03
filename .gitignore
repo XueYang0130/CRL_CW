@@ -19,8 +19,10 @@ venv/
 # IDE and OS
 .vscode/
 .DS_Store
+.matplotlib-cache/
 .mplconfig/
 MUJOCO_LOG.TXT
+tmp/
 
 # Experiment tracking
 wandb/
