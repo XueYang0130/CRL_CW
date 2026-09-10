@@ -113,7 +113,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--actor-cloning-coefficient", type=float, default=0.0)
     parser.add_argument(
         "--bc-gradient-strategy",
-        choices=("standard", "norm_balanced", "pcgrad_sac_priority"),
+        choices=(
+            "standard",
+            "norm_balanced",
+            "pcgrad_bc_priority",
+            "pcgrad_sac_priority",
+        ),
         default="standard",
     )
     parser.add_argument("--bc-max-norm-ratio", type=float, default=1.0)

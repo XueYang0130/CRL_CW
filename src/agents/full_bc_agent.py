@@ -45,6 +45,7 @@ class FullBehaviorCloningSACAgent(SACAgent):
         valid_gradient_strategies = {
             "standard",
             "norm_balanced",
+            "pcgrad_bc_priority",
             "pcgrad_sac_priority",
         }
         if bc_gradient_strategy not in valid_gradient_strategies:
@@ -314,14 +315,24 @@ class FullBehaviorCloningSACAgent(SACAgent):
             weighted_cloning_loss,
             parameters,
         )
-        applied_cloning_gradients, gradient_adjustment = (
-            self._apply_bc_gradient_strategy(
-                sac_gradients=gradients,
-                cloning_gradients=cloning_gradients,
+        applied_sac_gradients = gradients
+        if self.bc_gradient_strategy == "pcgrad_bc_priority":
+            applied_sac_gradients, gradient_adjustment = (
+                self._apply_sac_gradient_strategy(
+                    sac_gradients=gradients,
+                    cloning_gradients=cloning_gradients,
+                )
             )
-        )
+            applied_cloning_gradients = cloning_gradients
+        else:
+            applied_cloning_gradients, gradient_adjustment = (
+                self._apply_bc_gradient_strategy(
+                    sac_gradients=gradients,
+                    cloning_gradients=cloning_gradients,
+                )
+            )
         final_actor_gradients, combination_scale = self._combine_actor_gradients(
-            sac_gradients=gradients,
+            sac_gradients=applied_sac_gradients,
             applied_cloning_gradients=applied_cloning_gradients,
             conflict=bool(gradient_adjustment["conflict"]),
         )
@@ -342,6 +353,7 @@ class FullBehaviorCloningSACAgent(SACAgent):
                 bc_norm_scale=gradient_adjustment["bc_norm_scale"],
                 bc_combination_strategy=self.bc_combination_strategy,
                 bc_combination_scale=combination_scale,
+                applied_sac_gradients=applied_sac_gradients,
             )
         if collect_global:
             self._record_source_task_diagnostics(
@@ -350,6 +362,40 @@ class FullBehaviorCloningSACAgent(SACAgent):
                 current_task_index=task_index,
             )
         return final_actor_gradients
+
+    def _apply_sac_gradient_strategy(
+        self,
+        *,
+        sac_gradients: tuple[torch.Tensor, ...],
+        cloning_gradients: tuple[torch.Tensor, ...],
+    ) -> tuple[tuple[torch.Tensor, ...], dict[str, float | bool]]:
+        """Project conflicting shared SAC gradients while preserving BC."""
+        shared_indices = self.gradient_diagnostics.shared_indices
+        epsilon = 1e-12
+        bc_norm_sq = sum(
+            cloning_gradients[index].square().sum() for index in shared_indices
+        )
+        dot_product = sum(
+            (sac_gradients[index] * cloning_gradients[index]).sum()
+            for index in shared_indices
+        )
+        conflict = bool(dot_product.detach().item() < 0.0)
+        projection_applied = bool(
+            bc_norm_sq.detach().item() > epsilon and conflict
+        )
+        adjusted = list(sac_gradients)
+        if projection_applied:
+            projection_scale = dot_product / (bc_norm_sq + epsilon)
+            for index in shared_indices:
+                adjusted[index] = (
+                    adjusted[index]
+                    - projection_scale * cloning_gradients[index]
+                )
+        return tuple(adjusted), {
+            "projection_applied": projection_applied,
+            "bc_norm_scale": 1.0,
+            "conflict": conflict,
+        }
 
     def _combine_actor_gradients(
         self,
@@ -532,7 +578,7 @@ class FullBehaviorCloningSACAgent(SACAgent):
             for index in shared_indices
         )
         conflict = bool(dot_product.detach().item() < 0.0)
-        if self.bc_gradient_strategy == "standard":
+        if self.bc_gradient_strategy in {"standard", "pcgrad_bc_priority"}:
             return cloning_gradients, {
                 "projection_applied": False,
                 "bc_norm_scale": 1.0,

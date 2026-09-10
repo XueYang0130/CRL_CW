@@ -365,6 +365,61 @@ class TestGradientDiagnostics(unittest.TestCase):
             bc_gradients[nonshared],
         )
 
+    def test_bc_priority_pcgrad_projects_only_shared_sac_gradient(self) -> None:
+        agent = make_agent(
+            diagnostics=True,
+            gradient_strategy="pcgrad_bc_priority",
+        )
+        sac_gradients, bc_gradients = self.conflicting_gradients(agent)
+        adjusted, metadata = agent._apply_sac_gradient_strategy(
+            sac_gradients=sac_gradients,
+            cloning_gradients=bc_gradients,
+        )
+        shared = agent.gradient_diagnostics.shared_indices
+        dot = sum((adjusted[i] * bc_gradients[i]).sum() for i in shared)
+        self.assertGreaterEqual(float(dot), -1e-5)
+        self.assertTrue(metadata["projection_applied"])
+        self.assertEqual(metadata["bc_norm_scale"], 1.0)
+
+        nonshared = next(
+            index for index in range(len(adjusted)) if index not in shared
+        )
+        torch.testing.assert_close(adjusted[nonshared], sac_gradients[nonshared])
+
+        combined, scale = agent._combine_actor_gradients(
+            sac_gradients=adjusted,
+            applied_cloning_gradients=bc_gradients,
+            conflict=True,
+        )
+        self.assertEqual(scale, 1.0)
+        for sac, bc, final in zip(adjusted, bc_gradients, combined, strict=True):
+            torch.testing.assert_close(final, (sac + bc) / 2.0)
+
+        agent.gradient_diagnostics.record(
+            sac_gradients=sac_gradients,
+            bc_gradients=bc_gradients,
+            current_task_index=1,
+            raw_bc_loss=1.0,
+            bc_coefficient=100.0,
+            sac_actor_loss=1.0,
+            reference_memory_states=10,
+            applied_bc_gradients=bc_gradients,
+            final_actor_gradients=combined,
+            gradient_strategy="pcgrad_bc_priority",
+            projection_applied=True,
+            bc_norm_scale=1.0,
+            bc_combination_strategy="average",
+            bc_combination_scale=1.0,
+            applied_sac_gradients=adjusted,
+        )
+        shared_row = agent.gradient_diagnostics.drain()["windows"][0]
+        self.assertEqual(shared_row["projection_target"], "sac")
+        self.assertGreaterEqual(shared_row["applied_cosine_similarity"], -1e-5)
+        self.assertLess(
+            shared_row["applied_sac_to_raw_sac_norm_ratio"],
+            1.0,
+        )
+
     def test_parallel_norm_is_nonnegative_for_conflicting_gradients(self) -> None:
         agent = make_agent(diagnostics=True)
         sac_gradients = [
@@ -543,6 +598,38 @@ class TestGradientDiagnostics(unittest.TestCase):
         self.assertTrue(metadata["projection_applied"])
         self.assertAlmostEqual(float(scale), float(expected_scale), places=5)
         for sac, bc, final in zip(sac_gradients, adjusted, actual, strict=True):
+            torch.testing.assert_close(final, sac + scale * bc)
+
+    def test_adaptive_scaling_caps_conflict_without_projection(self) -> None:
+        agent = make_agent(
+            diagnostics=False,
+            gradient_strategy="standard",
+            combination_strategy="adaptive_additive",
+            adaptive_target_ratio=0.2,
+            adaptive_conflict_ratio=0.05,
+        )
+        sac_gradients, bc_gradients = self.conflicting_gradients(agent)
+        adjusted, metadata = agent._apply_bc_gradient_strategy(
+            sac_gradients=sac_gradients,
+            cloning_gradients=bc_gradients,
+        )
+        actual, scale = agent._combine_actor_gradients(
+            sac_gradients=sac_gradients,
+            applied_cloning_gradients=adjusted,
+            conflict=bool(metadata["conflict"]),
+        )
+        shared = agent.gradient_diagnostics.shared_indices
+        sac_norm = sum(sac_gradients[i].square().sum() for i in shared).sqrt()
+        bc_norm = sum(bc_gradients[i].square().sum() for i in shared).sqrt()
+        expected_scale = 0.05 * sac_norm / bc_norm
+
+        self.assertTrue(metadata["conflict"])
+        self.assertFalse(metadata["projection_applied"])
+        self.assertEqual(metadata["bc_norm_scale"], 1.0)
+        self.assertAlmostEqual(float(scale), float(expected_scale), places=5)
+        for original, returned in zip(bc_gradients, adjusted, strict=True):
+            self.assertIs(original, returned)
+        for sac, bc, final in zip(sac_gradients, bc_gradients, actual, strict=True):
             torch.testing.assert_close(final, sac + scale * bc)
 
     def test_standard_update_uses_original_weighted_loss_gradient_order(self) -> None:

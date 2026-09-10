@@ -185,7 +185,15 @@ class GradientConflictDiagnostics:
         bc_norm_scale: float,
         bc_combination_strategy: str,
         bc_combination_scale: float,
+        applied_sac_gradients: tuple[torch.Tensor, ...] | None = None,
     ) -> None:
+        if applied_sac_gradients is None:
+            applied_sac_gradients = sac_gradients
+        projection_target = "none"
+        if projection_applied:
+            projection_target = (
+                "sac" if gradient_strategy == "pcgrad_bc_priority" else "bc"
+            )
         base = {
             "update_index": self.update_index,
             "evaluation_index": None,
@@ -202,6 +210,7 @@ class GradientConflictDiagnostics:
             "bc_coefficient": bc_coefficient,
             "gradient_strategy": gradient_strategy,
             "projection_applied": projection_applied,
+            "projection_target": projection_target,
             "bc_norm_scale": bc_norm_scale,
             "bc_combination_strategy": bc_combination_strategy,
             "bc_combination_scale": bc_combination_scale,
@@ -209,11 +218,14 @@ class GradientConflictDiagnostics:
         }
         metrics = _gradient_metrics(sac_gradients, bc_gradients, self.shared_indices)
         applied_metrics = _gradient_metrics(
-            sac_gradients,
+            applied_sac_gradients,
             applied_bc_gradients,
             self.shared_indices,
         )
         shared_sac_norm = _gradient_norm(sac_gradients, self.shared_indices)
+        shared_applied_sac_norm = _gradient_norm(
+            applied_sac_gradients, self.shared_indices
+        )
         shared_final_norm = _gradient_norm(final_actor_gradients, self.shared_indices)
         shared_row = {
             **base,
@@ -222,6 +234,14 @@ class GradientConflictDiagnostics:
             "combined_gradient_norm": float(shared_final_norm.detach().item()),
             "combined_to_sac_norm_ratio": float(
                 (shared_final_norm / (shared_sac_norm + 1e-12)).detach().item()
+            ),
+            "applied_sac_gradient_norm": float(
+                shared_applied_sac_norm.detach().item()
+            ),
+            "applied_sac_to_raw_sac_norm_ratio": float(
+                (shared_applied_sac_norm / (shared_sac_norm + 1e-12))
+                .detach()
+                .item()
             ),
             "applied_bc_gradient_norm": applied_metrics["bc_gradient_norm"],
             "applied_bc_to_sac_norm_ratio": applied_metrics[
@@ -232,11 +252,14 @@ class GradientConflictDiagnostics:
         }
         full_metrics = _gradient_metrics(sac_gradients, bc_gradients, self.all_indices)
         applied_full_metrics = _gradient_metrics(
-            sac_gradients,
+            applied_sac_gradients,
             applied_bc_gradients,
             self.all_indices,
         )
         full_sac_norm = _gradient_norm(sac_gradients, self.all_indices)
+        full_applied_sac_norm = _gradient_norm(
+            applied_sac_gradients, self.all_indices
+        )
         full_final_norm = _gradient_norm(final_actor_gradients, self.all_indices)
         full_norm = float(full_final_norm.detach().item())
         clip_scale = (
@@ -254,6 +277,14 @@ class GradientConflictDiagnostics:
                     "combined_gradient_norm": full_norm,
                     "combined_to_sac_norm_ratio": float(
                         (full_final_norm / (full_sac_norm + 1e-12)).detach().item()
+                    ),
+                    "applied_sac_gradient_norm": float(
+                        full_applied_sac_norm.detach().item()
+                    ),
+                    "applied_sac_to_raw_sac_norm_ratio": float(
+                        (full_applied_sac_norm / (full_sac_norm + 1e-12))
+                        .detach()
+                        .item()
                     ),
                     "applied_bc_gradient_norm": applied_full_metrics[
                         "bc_gradient_norm"
@@ -287,11 +318,14 @@ class GradientConflictDiagnostics:
                 indices,
             )
             applied_layer_metrics = _gradient_metrics(
-                sac_gradients,
+                applied_sac_gradients,
                 applied_bc_gradients,
                 indices,
             )
             layer_sac_norm = _gradient_norm(sac_gradients, indices)
+            layer_applied_sac_norm = _gradient_norm(
+                applied_sac_gradients, indices
+            )
             layer_final_norm = _gradient_norm(final_actor_gradients, indices)
             self._layer_rows.append(
                 {
@@ -301,6 +335,14 @@ class GradientConflictDiagnostics:
                     "combined_gradient_norm": float(layer_final_norm.detach().item()),
                     "combined_to_sac_norm_ratio": float(
                         (layer_final_norm / (layer_sac_norm + 1e-12)).detach().item()
+                    ),
+                    "applied_sac_gradient_norm": float(
+                        layer_applied_sac_norm.detach().item()
+                    ),
+                    "applied_sac_to_raw_sac_norm_ratio": float(
+                        (layer_applied_sac_norm / (layer_sac_norm + 1e-12))
+                        .detach()
+                        .item()
                     ),
                     "applied_bc_gradient_norm": applied_layer_metrics[
                         "bc_gradient_norm"

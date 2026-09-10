@@ -18,6 +18,9 @@ from methods.stage_aware_semantic_bc import METHOD as STAGE_AWARE_SEMANTIC_BC
 from methods.success_replay_best_adaptive_pcgrad import (
     METHOD as SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
 )
+from methods.success_replay_best_adaptive_scaling import (
+    METHOD as SUCCESS_REPLAY_BEST_ADAPTIVE_SCALING,
+)
 from methods.success_replay_best_layerwise_adaptive_pcgrad import (
     METHOD as SUCCESS_REPLAY_BEST_LAYERWISE_ADAPTIVE_PCGRAD,
 )
@@ -63,6 +66,9 @@ from methods.success_replay_best_llm_prior_pcgrad import (
 )
 from methods.success_replay_best import METHOD as SUCCESS_REPLAY_BEST
 from methods.success_replay_best_pcgrad import METHOD as SUCCESS_REPLAY_BEST_PCGRAD
+from methods.success_replay_best_bc_priority_pcgrad import (
+    METHOD as SUCCESS_REPLAY_BEST_BC_PRIORITY_PCGRAD,
+)
 from methods.success_replay_final import METHOD as SUCCESS_REPLAY_FINAL
 from methods.task_conditioned import METHOD as TASK_CONDITIONED
 from methods.wsrl_continual import METHOD as WSRL_CONTINUAL
@@ -94,7 +100,9 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
         SUCCESS_REPLAY_FINAL,
         SUCCESS_REPLAY_BEST,
         SUCCESS_REPLAY_BEST_PCGRAD,
+        SUCCESS_REPLAY_BEST_BC_PRIORITY_PCGRAD,
         SUCCESS_REPLAY_BEST_ADAPTIVE_PCGRAD,
+        SUCCESS_REPLAY_BEST_ADAPTIVE_SCALING,
         SUCCESS_REPLAY_BEST_LAYERWISE_ADAPTIVE_PCGRAD,
         SUCCESS_REPLAY_MIXED80_OPTIMISTIC_NSTEP_PCGRAD,
         SUCCESS_REPLAY_BEST_KL_BUDGET_PCGRAD,
@@ -126,6 +134,7 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
     "success_replay_final": "standard",
     "success_replay_best": "standard",
     "success_replay_best_pcgrad": "pcgrad_sac_priority",
+    "success_replay_best_bc_priority_pcgrad": "pcgrad_bc_priority",
     "success_replay_best_adaptive_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_layerwise_adaptive_pcgrad": "pcgrad_sac_priority",
     "success_replay_mixed80_optimistic_nstep_pcgrad": "pcgrad_sac_priority",
@@ -145,6 +154,7 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
 }
 
 BC_COMBINATION_STRATEGY_BY_METHOD = {
+    "success_replay_best_adaptive_scaling": "adaptive_additive",
     "success_replay_best_adaptive_pcgrad": "adaptive_additive",
     "success_replay_best_layerwise_adaptive_pcgrad": "adaptive_additive",
     "success_replay_mixed80_optimistic_nstep_pcgrad": "adaptive_additive",

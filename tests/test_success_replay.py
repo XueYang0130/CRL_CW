@@ -156,9 +156,17 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
             "success_replay_final": ("final", "standard"),
             "success_replay_best": ("best", "standard"),
             "success_replay_best_pcgrad": ("best", "pcgrad_sac_priority"),
+            "success_replay_best_bc_priority_pcgrad": (
+                "best",
+                "pcgrad_bc_priority",
+            ),
             "success_replay_best_adaptive_pcgrad": (
                 "best",
                 "pcgrad_sac_priority",
+            ),
+            "success_replay_best_adaptive_scaling": (
+                "best",
+                "standard",
             ),
             "success_replay_best_jumpstart_adaptive_pcgrad": (
                 "best",
@@ -196,6 +204,7 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
                 )
                 self.assertEqual(method.defaults["episodic_memory_per_task"], 10_000)
                 if method_id in {
+                    "success_replay_best_adaptive_scaling",
                     "success_replay_best_adaptive_pcgrad",
                     "success_replay_best_jumpstart_adaptive_pcgrad",
                     "success_replay_best_random_broader_adaptive_pcgrad",
