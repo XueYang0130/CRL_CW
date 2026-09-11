@@ -70,6 +70,9 @@ from methods.success_replay_best_bc_priority_pcgrad import (
     METHOD as SUCCESS_REPLAY_BEST_BC_PRIORITY_PCGRAD,
 )
 from methods.success_replay_final import METHOD as SUCCESS_REPLAY_FINAL
+from methods.success_replay_final_pcgrad import (
+    METHOD as SUCCESS_REPLAY_FINAL_PCGRAD,
+)
 from methods.task_conditioned import METHOD as TASK_CONDITIONED
 from methods.wsrl_continual import METHOD as WSRL_CONTINUAL
 
@@ -98,6 +101,7 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
         SEMANTIC_HYBRID_BC,
         STAGE_AWARE_SEMANTIC_BC,
         SUCCESS_REPLAY_FINAL,
+        SUCCESS_REPLAY_FINAL_PCGRAD,
         SUCCESS_REPLAY_BEST,
         SUCCESS_REPLAY_BEST_PCGRAD,
         SUCCESS_REPLAY_BEST_BC_PRIORITY_PCGRAD,
@@ -132,6 +136,7 @@ BC_GRADIENT_STRATEGY_BY_METHOD = {
     "full_bc_norm_balanced": "norm_balanced",
     "full_bc_pcgrad": "pcgrad_sac_priority",
     "success_replay_final": "standard",
+    "success_replay_final_pcgrad": "pcgrad_sac_priority",
     "success_replay_best": "standard",
     "success_replay_best_pcgrad": "pcgrad_sac_priority",
     "success_replay_best_bc_priority_pcgrad": "pcgrad_bc_priority",

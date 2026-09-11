@@ -154,6 +154,10 @@ class SuccessfulReplayMethodTests(unittest.TestCase):
     def test_teacher_and_gradient_strategy_presets(self) -> None:
         expected = {
             "success_replay_final": ("final", "standard"),
+            "success_replay_final_pcgrad": (
+                "final",
+                "pcgrad_sac_priority",
+            ),
             "success_replay_best": ("best", "standard"),
             "success_replay_best_pcgrad": ("best", "pcgrad_sac_priority"),
             "success_replay_best_bc_priority_pcgrad": (

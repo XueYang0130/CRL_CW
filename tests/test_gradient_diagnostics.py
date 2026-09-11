@@ -8,7 +8,12 @@ import numpy as np
 import torch
 
 from agents import FullBehaviorCloningSACAgent
-from utils import load_sac_checkpoint, save_sac_checkpoint
+from agents.gradient_diagnostics import (
+    GRADIENT_LAYER_FIELDS,
+    GRADIENT_TASK_PAIR_FIELDS,
+    GRADIENT_WINDOW_FIELDS,
+)
+from utils import append_csv_rows, load_sac_checkpoint, save_sac_checkpoint
 
 
 def make_agent(
@@ -412,7 +417,44 @@ class TestGradientDiagnostics(unittest.TestCase):
             bc_combination_scale=1.0,
             applied_sac_gradients=adjusted,
         )
-        shared_row = agent.gradient_diagnostics.drain()["windows"][0]
+        agent.gradient_diagnostics.record_task_pair(
+            sac_gradients=sac_gradients,
+            bc_gradients=bc_gradients,
+            current_task_index=1,
+            source_task_index=0,
+            raw_bc_loss=1.0,
+            bc_coefficient=100.0,
+            sac_actor_loss=1.0,
+            reference_memory_states=10,
+            source_memory_states=10,
+        )
+        rows = agent.gradient_diagnostics.drain()
+        for row in rows["windows"]:
+            self.assertLessEqual(set(row), set(GRADIENT_WINDOW_FIELDS))
+        for row in rows["layers"]:
+            self.assertLessEqual(set(row), set(GRADIENT_LAYER_FIELDS))
+        for row in rows["task_pairs"]:
+            self.assertLessEqual(set(row), set(GRADIENT_TASK_PAIR_FIELDS))
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            directory = Path(temporary_directory)
+            append_csv_rows(
+                directory / "windows.csv",
+                GRADIENT_WINDOW_FIELDS,
+                rows["windows"],
+            )
+            append_csv_rows(
+                directory / "layers.csv",
+                GRADIENT_LAYER_FIELDS,
+                rows["layers"],
+            )
+            append_csv_rows(
+                directory / "task_pairs.csv",
+                GRADIENT_TASK_PAIR_FIELDS,
+                rows["task_pairs"],
+            )
+
+        shared_row = rows["windows"][0]
         self.assertEqual(shared_row["projection_target"], "sac")
         self.assertGreaterEqual(shared_row["applied_cosine_similarity"], -1e-5)
         self.assertLess(
