@@ -155,6 +155,7 @@ CW10_TASK_SUMMARY_FIELDS = [
     "segment_selection_reason",
     "segment_selection_source",
     "success_replay_teacher",
+    "all_replay_teacher",
     "best_teacher_step",
     "best_teacher_success",
     "best_teacher_return",
@@ -1191,12 +1192,14 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
         total_tasks=len(tasks),
     )
     bounds_env.close()
-    if method.complete_reference_memory and not isinstance(
+    if (
+        method.complete_reference_memory or method.all_replay_teacher is not None
+    ) and not isinstance(
         agent,
         FullBehaviorCloningSACAgent,
     ):
         raise RuntimeError(
-            f"Method {args.method} declares complete reference memory but its "
+            f"Method {args.method} declares reference memory but its "
             "agent cannot store behavior-cloning reference observations."
         )
     if hasattr(agent, "bc_gradient_strategy"):
@@ -1990,7 +1993,10 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                 )
             task_curve_success.append(float(active_row["stochastic_success_rate"]))
             task_curve_returns.append(float(active_row["stochastic_average_return"]))
-            if method.success_replay_teacher == "best":
+            if (
+                method.success_replay_teacher == "best"
+                or method.all_replay_teacher == "best"
+            ):
                 candidate_score = (
                     float(active_row["stochastic_success_rate"]),
                     float(active_row["stochastic_average_return"]),
@@ -2542,6 +2548,46 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     },
                     teacher_dir / f"task_{task_index}_best_actor.pt",
                 )
+        elif method.all_replay_teacher is not None:
+            if not isinstance(agent, FullBehaviorCloningSACAgent):
+                raise RuntimeError(
+                    "All-replay relabeling requires FullBehaviorCloningSACAgent."
+                )
+            replay_batch = replay_buffer.sample(
+                args.episodic_memory_per_task,
+                agent.device,
+            )
+            reference_observations = replay_batch.observations
+            reference_states = int(reference_observations.shape[0])
+            if method.all_replay_teacher == "best" and best_teacher_state is None:
+                raise RuntimeError(
+                    "Best-teacher all-replay relabeling has no validation snapshot."
+                )
+            add_relabelled_reference_memory(
+                agent=agent,
+                observations=reference_observations,
+                teacher_actor_state=(
+                    best_teacher_state
+                    if method.all_replay_teacher == "best"
+                    else None
+                ),
+            )
+            if method.all_replay_teacher == "best":
+                if best_teacher_step is None:
+                    raise RuntimeError("Best-teacher snapshot is missing at task end.")
+                teacher_dir = run_dir / "teacher_snapshots"
+                teacher_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    {
+                        "actor_state_dict": best_teacher_state,
+                        "task_index": task_index,
+                        "task_name": task_name,
+                        "validation_step": best_teacher_step,
+                        "validation_success": best_teacher_score[0],
+                        "validation_return": best_teacher_score[1],
+                    },
+                    teacher_dir / f"task_{task_index}_best_actor.pt",
+                )
         if method.complete_reference_memory or args.method in {
             "semantic_local_bc",
             "adaptive_semantic_bc",
@@ -2826,6 +2872,7 @@ def run_cw10_experiment(args: Any, run_dir: Path) -> dict[str, Any]:
                     None if segment_selection is None else segment_selection.selection_source
                 ),
                 "success_replay_teacher": method.success_replay_teacher,
+                "all_replay_teacher": method.all_replay_teacher,
                 "best_teacher_step": best_teacher_step,
                 "best_teacher_success": (
                     None if best_teacher_step is None else best_teacher_score[0]

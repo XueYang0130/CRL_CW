@@ -1,4 +1,5 @@
 from methods.base import MethodSpec
+from methods.all_replay_best_pcgrad import METHOD as ALL_REPLAY_BEST_PCGRAD
 from methods.adaptive_semantic_bc import METHOD as ADAPTIVE_SEMANTIC_BC
 from methods.clonex_sac import METHOD as CLONEX_SAC
 from methods.full_bc import METHOD as FULL_BC
@@ -85,6 +86,7 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
     method.method_id: method
     for method in (
         SINGLE_TASK_BASELINE,
+        ALL_REPLAY_BEST_PCGRAD,
         FINE_TUNING,
         L2,
         EWC,
@@ -130,6 +132,7 @@ METHOD_REGISTRY: dict[str, MethodSpec] = {
 }
 
 BC_GRADIENT_STRATEGY_BY_METHOD = {
+    "all_replay_best_pcgrad": "pcgrad_sac_priority",
     "clonex_sac": "standard",
     "recall": "standard",
     "full_bc": "standard",

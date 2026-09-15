@@ -33,6 +33,7 @@ class MethodSpec:
     reference_exploration: bool = False
     complete_reference_memory: bool = False
     success_replay_teacher: str | None = None
+    all_replay_teacher: str | None = None
     broader_replay_selector: str | None = None
     broader_replay_ratio: float = 0.0
     dynamic_broader_replay_fill: bool = False
@@ -45,6 +46,14 @@ class MethodSpec:
         if self.success_replay_teacher not in {None, "final", "best"}:
             raise ValueError(
                 "success_replay_teacher must be None, 'final', or 'best'."
+            )
+        if self.all_replay_teacher not in {None, "final", "best"}:
+            raise ValueError(
+                "all_replay_teacher must be None, 'final', or 'best'."
+            )
+        if self.success_replay_teacher is not None and self.all_replay_teacher is not None:
+            raise ValueError(
+                "Success-only and all-replay state selection are mutually exclusive."
             )
         if self.broader_replay_selector not in {None, "random", "llm"}:
             raise ValueError(

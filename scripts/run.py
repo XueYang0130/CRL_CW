@@ -481,11 +481,14 @@ def parse_args() -> argparse.Namespace:
     if not math.isfinite(args.priority_epsilon) or args.priority_epsilon <= 0.0:
         parser.error("--priority-epsilon must be finite and positive.")
     if (
-        get_method(args.method).success_replay_teacher is not None
+        (
+            get_method(args.method).success_replay_teacher is not None
+            or get_method(args.method).all_replay_teacher is not None
+        )
         and args.episodic_memory_per_task <= 0
     ):
         parser.error(
-            "Successful replay methods require --episodic-memory-per-task "
+            "Reference replay methods require --episodic-memory-per-task "
             "to be positive."
         )
     if args.start_steps < 0 or args.update_after < 0 or args.update_every <= 0:
